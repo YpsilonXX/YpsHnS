@@ -10,15 +10,16 @@ namespace Yps
     private:
         AuthorKey();
 
-        /**
-         * Forbidden copy and "=" constructor
-         */
-        AuthorKey(const AuthorKey&) = delete;
-        AuthorKey& operator=(const AuthorKey&) = delete;
-
         static std::unique_ptr<AuthorKey> instance;
 
     public:
+
+        /**
+        * Forbidden copy and "=" constructor
+        */
+        AuthorKey(const AuthorKey&) = delete;
+        AuthorKey& operator=(const AuthorKey&) = delete;
+
         static AuthorKey& getInstance()
         {
             static AuthorKey instance;
