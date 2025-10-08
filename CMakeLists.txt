@@ -15,6 +15,7 @@ set(SRC main.cc
         internal/Encryption/Encryption.cc
         internal/Encryption/Encryption.hh
         internal/AuthorKey/AuthorKey.hh
+        internal/AuthorKey/AuthorKey.cc
 
 )
 

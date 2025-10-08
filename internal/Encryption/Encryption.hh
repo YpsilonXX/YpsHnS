@@ -17,15 +17,17 @@ namespace Yps
     class Encryption
     {
     private:
-        Encryption();
+        Encryption(){};
+
+
+    public:
 
         /**
-         * Forbidden copy and "=" constructor
-         */
+        * Forbidden copy and "=" constructor
+        */
         Encryption(const Encryption&) = delete;
         Encryption& operator=(const Encryption&) = delete;
 
-    public:
         static Encryption& getInstance();
 
         /**
