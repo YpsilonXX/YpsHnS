@@ -30,6 +30,10 @@
 
 namespace Yps
 {
+    /**
+     * Singleton class to gen machine-unique 256bit key.
+     * If gen type UUID - key will be unique for every generation
+     */
     class AuthorKey
     {
     private:
