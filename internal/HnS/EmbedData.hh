@@ -15,59 +15,71 @@
 
 namespace Yps
 {
-
-struct EmbedData
-{
-    EmbedData() = default;
-    explicit EmbedData(std::vector<std::uint8_t> plain_data)
-        : plaintext(std::move(plain_data)) {}
-    ~EmbedData() { secure_erase_key(); }
-
-
-    /**
-     * Source data for encrypt and embed
-     * @note data stored as vector of bytes for validity all types
-     */
-    std::vector<byte> plain_data;
-
-    /**
-     * Data ready to embed to file
-     */
-    std::vector<byte> embed_data;
-
-    std::optional<std::vector<uint8_t>> encryption_key;
-    std::optional<std::vector<uint8_t>> init_vector;
-
-    struct MediaMetadata
+    enum class ContainerType
     {
-        /**type: "image/jpeg", "video/mp4", etc*/
-        std::string type;
-        std::size_t embed_position;
-        std::size_t max_capacity;   //for embed
+        UNKNOWN, PHOTO, VIDEO, AUDIO
     };
-    std::optional<MediaMetadata> metadata;
 
-    enum class Status
+    enum class Extension
     {
-        Uninitialized,
-        Encrypted,
-        Embedded,
-        Extracted
+        JPEG, PNG
     };
-    Status status = Status::Uninitialized;
 
-private:
-    /**
-     * Secure delete encryption_key
-     */
-    void secure_erase_key() {
-        if (encryption_key) {
-            std::fill(encryption_key->begin(), encryption_key->end(), 0);
-            encryption_key->clear();
-            encryption_key.reset();
-        }
-    }
-};
+    struct MetaData
+    {
+        /**
+         * Type of container
+         */
+        ContainerType container;
+
+        /**
+         * Container's extension
+         */
+        Extension ext;
+
+        /**
+         * Name of plain(to embed) file
+         */
+        std::string filename;
+
+        /**
+         * Size of all written path (meta + plain)
+         */
+        uint64_t write_size;
+
+        /**
+         * Size of meta_data
+         */
+        const uint32_t meta_size = sizeof(MetaData);
+    };
+
+
+    struct EmbedData
+    {
+        EmbedData() = default;
+        ~EmbedData() = default;
+
+        /**
+         * Raw Data
+         */
+        std::vector<byte> plain_data;
+        /**
+         * Encrypted Data
+         */
+        std::vector<byte> encrypt_data;
+
+        /**
+         * Metadata to embed with plain data
+         */
+        MetaData meta;
+
+        /**
+         * Max size of data to embed
+         */
+        uint64_t max_capacity{};
+
+
+    };
 
 }
 

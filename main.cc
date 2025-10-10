@@ -1,6 +1,7 @@
 #include <iostream>
 #include <AuthorKey.hh>
 
+#include "EmbedData.hh"
 #include "Encryption.hh"
 
 int main(void)
@@ -31,6 +32,12 @@ int main(void)
 
     std::cout << en_line << std::endl;
     std::cout << de_line << std::endl;
+
+    std::cout << "-------------------" << std::endl;
+
+    Yps::MetaData meta;
+    std::cout << "sizeof(meta): " << sizeof(meta) << std::endl;
+    std::cout << "meta.size: " << meta.meta_size << std::endl;
 
     return 0;
 }

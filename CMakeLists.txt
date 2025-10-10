@@ -16,7 +16,11 @@ set(SRC main.cc
         internal/Encryption/Encryption.hh
         internal/AuthorKey/AuthorKey.hh
         internal/AuthorKey/AuthorKey.cc
-
+        external/stb_image/stb_image.h
+        external/stb_image/stb_image_write.h
+        internal/PhotoHnS/PhotoHnS.cc
+        internal/PhotoHnS/PhotoHnS.hh
+        internal/PhotoHnS/jpg.hh
 )
 
 find_package(OpenSSL REQUIRED)
@@ -26,6 +30,7 @@ include_directories(internal/
                     internal/Encryption
                     internal/AuthorKey
                     external/
+                    external/stb_image
 
 )
 
