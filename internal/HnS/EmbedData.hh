@@ -25,6 +25,12 @@ namespace Yps
         JPEG, PNG
     };
 
+    enum class LsbMode {
+        OneBit,
+        TwoBits,
+        NoUsed
+    };
+
     struct MetaData
     {
         /**
@@ -46,6 +52,11 @@ namespace Yps
          * Size of all written path (meta + plain)
          */
         uint64_t write_size;
+
+        /**
+         * Type of written lsb_mode
+         */
+        LsbMode lsb_mode{LsbMode::NoUsed};
 
         /**
          * Size of meta_data
@@ -78,7 +89,10 @@ namespace Yps
          */
         uint64_t max_capacity{};
 
-
+        /**
+         * Key for cryptography
+         */
+        std::array<byte, SHA256_DIGEST_LENGTH> key;
     };
 
 }

@@ -20,7 +20,6 @@ set(SRC main.cc
         external/stb_image/stb_image_write.h
         internal/PhotoHnS/PhotoHnS.cc
         internal/PhotoHnS/PhotoHnS.hh
-        internal/PhotoHnS/jpg.hh
 )
 
 find_package(OpenSSL REQUIRED)
