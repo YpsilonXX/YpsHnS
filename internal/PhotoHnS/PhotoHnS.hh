@@ -24,11 +24,24 @@ namespace Yps
         /**
          * Technical embed into PNG. Used EmbedData
          * @param out_path Path to output file
+         * @return out_path or std::nullptr if failed
          */
-        void png_in(const std::string& out_path);
+        std::optional<std::string> png_in(const std::string& out_path);
 
-        void png_out(const std::string& path);
+        std::optional<std::string> png_out(const std::string& path);
 
+        /**
+         *  Pack data to image
+         * @param image image's data
+         * @param data data to embed
+         */
+        static void lsb_one_bit(byte* image, std::vector<byte>& data);
+        /**
+         *  Pack data to image
+         * @param image image's data
+         * @param data data to embed
+         */
+        void lsb_two_bit(byte* image, std::vector<byte>& data);
 
         std::unique_ptr<EmbedData> embed_data;
     public:

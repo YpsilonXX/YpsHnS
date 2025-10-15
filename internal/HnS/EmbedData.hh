@@ -7,11 +7,13 @@
 
 #include <vector>
 #include <string>
+#include <array>
 #include <optional>
 #include <cstdint>
 #include <memory>
 #include <algorithm>
 #include <defines.hh>
+#include <openssl/sha.h>
 
 namespace Yps
 {
