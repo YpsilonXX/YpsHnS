@@ -179,9 +179,63 @@ namespace Yps
 
     }
 
+    std::optional<std::string> PhotoHnS::png_out(const std::string& path)
+    {
+
+    }
 
     std::optional<std::vector<byte>> PhotoHnS::extract(const std::string& path)
     {
+        /*Load image*/
+        int32_t width, height, channels;
+        byte* image = stbi_load(path.c_str(), &width, &height, &channels, 0);
+        if (!image) {
+            std::cout << CLI_RED << "Error: Failed to load PNG from " << path << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+
+        /*Size of metainfo in bits*/
+        uint64_t meta_size = sizeof(MetaData) * 8;
+        if (meta_size > width * height * channels * 8)
+        {
+            stbi_image_free(image);
+            std::cout << CLI_RED << "Error: size of file too small" << path << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+
+        std::vector<byte> meta_bytes(meta_size, 0);
+        size_t bit_pos = 0;
+        for (size_t i = 0; i < sizeof(MetaData) * 8; ++i) {
+            byte bit = image[i] & 0x01;  // LSB bit
+            size_t byte_idx = bit_pos / 8;
+            size_t bit_offset = bit_pos % 8;
+            meta_bytes[byte_idx] |= (bit << (7 - bit_offset));  // set current bit
+            ++bit_pos;
+        }
+
+        /*Parse Meta*/
+        MetaData meta;
+        std::copy(meta_bytes.begin(), meta_bytes.end(), reinterpret_cast<byte*>(&meta));
+
+        /*Check Meta for valid*/
+        if (meta.container != ContainerType::PHOTO) {
+            stbi_image_free(image);
+            std::cout << CLI_RED << "Error: Invalid metadata in image" << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+
+        switch (meta.ext)
+        {
+            case Extension::PNG:
+                png_out(path);
+                break;
+            case Extension::JPEG:
+                break;
+            default:
+                break;
+        }
+
+
         std::optional<std::vector<byte>> data;
         return data;
     }
