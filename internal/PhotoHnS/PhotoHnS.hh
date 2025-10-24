@@ -28,7 +28,7 @@ namespace Yps
          */
         std::optional<std::string> png_in(const std::string& out_path);
 
-        std::optional<std::string> png_out(const std::string& path);
+        std::optional<std::string> png_out(byte* image, uint64_t img_size, MetaData& meta, const std::string& path);
 
         /**
          *  Pack data to image

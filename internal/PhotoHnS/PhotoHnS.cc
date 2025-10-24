@@ -179,9 +179,65 @@ namespace Yps
 
     }
 
-    std::optional<std::string> PhotoHnS::png_out(const std::string& path)
+    std::optional<std::string> PhotoHnS::png_out(byte* image, uint64_t img_size, MetaData& meta, const std::string& path)
     {
+        // Prepare full_data (meta + encrypt_data)
+        std::vector<byte> full_data(meta.write_size, 0);
+        std::copy(reinterpret_cast<const byte*>(&meta), reinterpret_cast<const byte*>(&meta) + meta_bytes_size,
+              full_data.begin());
 
+        // Extract encrypt_data based on lsb_mode (starting after meta)
+        uint64_t encrypt_bits_start = meta.meta_size * 8;
+        uint64_t encrypt_bytes_size = meta.write_size - meta.meta_size;
+        uint64_t encrypt_bits = encrypt_bytes_size * 8;
+        uint64_t bit_pos = encrypt_bits_start;  // Start after meta bits
+        uint64_t img_idx = meta.meta_size;  // Image bytes used for meta (1 bit/byte)
+
+        bool extraction_success = true;
+        if (meta.lsb_mode == LsbMode::OneBit) {
+            // OneBit: 1 bit per image byte
+            for (; bit_pos < total_bits && img_idx < num_image_bytes; ++img_idx, ++bit_pos) {
+                byte bit = image[img_idx] & 0x01;
+                uint64_t byte_idx = bit_pos / 8 + meta_bytes_size;  // Offset to encrypt_data
+                uint64_t bit_offset = bit_pos % 8;
+                full_data[byte_idx] |= (bit << (7 - bit_offset));  // MSB-first
+            }
+        } else if (meta.lsb_mode == LsbMode::TwoBits) {
+            // TwoBits: 2 bits per image byte (mirror embed: MSB-first shift)
+            for (; bit_pos < total_bits && img_idx < num_image_bytes; img_idx++, bit_pos += 2) {
+                if (bit_pos + 1 >= total_bits) break;  // Ensure even bits
+                byte bits = image[img_idx] & 0x03;  // Lower 2 bits
+                uint64_t byte_idx = bit_pos / 8 + meta_bytes_size;
+                uint64_t bit_offset = bit_pos % 8;
+                uint64_t shift = 6 - bit_offset;  // 6,4,2,0 for %8=0,2,4,6 (matches lsb_two_bit)
+                full_data[byte_idx] |= (bits << shift);
+            }
+        } else {
+            extraction_success = false;
+            std::cout << CLI_RED << "Error: Unsupported LsbMode: " << static_cast<int>(meta.lsb_mode) << CLI_RESET << std::endl;
+        }
+
+        if (!extraction_success || bit_pos < total_bits) {
+            std::cout << CLI_RED << "Error: Incomplete data extraction (mode: "
+                      << static_cast<int>(meta.lsb_mode) << ", extracted: " << bit_pos << "/" << total_bits << " bits)" << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+
+        // Extract encrypt_data
+        std::vector<byte> encrypt_data(full_data.begin() + meta_bytes_size, full_data.end());
+        embed_data->encrypt_data = encrypt_data;
+
+
+        // Decrypt (use class-wide key logic)
+        std::array<byte, SHA256_DIGEST_LENGTH> key = this->embed_data->key;
+        AES256Encryption::getInstance().set_key(key);
+        std::vector<byte> plain_data = AES256Encryption::getInstance().decrypt(encrypt_data);
+        embed_data->plain_data = plain_data;
+
+        std::cout << CLI_GREEN << "Success: Extracted " << plain_data.size() << " plain bytes (mode: "
+                  << static_cast<int>(meta.lsb_mode) << ")" << CLI_RESET << std::endl;
+
+        return path;
     }
 
     std::optional<std::vector<byte>> PhotoHnS::extract(const std::string& path)
@@ -214,17 +270,16 @@ namespace Yps
         }
 
         /*Parse Meta*/
-        MetaData meta;
-        std::copy(meta_bytes.begin(), meta_bytes.end(), reinterpret_cast<byte*>(&meta));
+        std::copy(meta_bytes.begin(), meta_bytes.end(), reinterpret_cast<byte*>(&this->embed_data->meta));
 
         /*Check Meta for valid*/
-        if (meta.container != ContainerType::PHOTO) {
+        if (this->embed_data->meta.container != ContainerType::PHOTO) {
             stbi_image_free(image);
             std::cout << CLI_RED << "Error: Invalid metadata in image" << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        switch (meta.ext)
+        switch (this->embed_data->meta.ext)
         {
             case Extension::PNG:
                 png_out(path);
@@ -235,8 +290,7 @@ namespace Yps
                 break;
         }
 
-
-        std::optional<std::vector<byte>> data;
+        std::optional<std::vector<byte>> data = this->embed_data->plain_data;
         return data;
     }
 
