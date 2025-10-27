@@ -24,24 +24,35 @@ namespace Yps
         /**
          * Technical embed into PNG. Used EmbedData
          * @param out_path Path to output file
-         * @return out_path or std::nullptr if failed
+         * @return out_path or std::nullopt if failed
          */
         std::optional<std::string> png_in(const std::string& out_path);
 
-        std::optional<std::string> png_out(byte* image, uint64_t img_size, MetaData& meta, const std::string& path);
+        /**
+         * Technical extract from PNG. Used EmbedData and sets plain_data if success.
+         * @param image loaded image bytes
+         * @param meta extracted metadata
+         * @param path input path (for logging)
+         * @return path if success, nullopt otherwise
+         */
+        std::optional<std::string> png_out(byte* image, MetaData& meta, const std::string& path);
 
         /**
-         *  Pack data to image
-         * @param image image's data
-         * @param data data to embed
+         * Pack data to image using 1 LSB bit per image byte (MSB-first bit order).
+         * @param image image's data (modified in place)
+         * @param data data to embed (const, for safety)
+         * @param img_bytes total image bytes (for bound check)
          */
-        static void lsb_one_bit(byte* image, std::vector<byte>& data);
+        void lsb_one_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes);
+
         /**
-         *  Pack data to image
-         * @param image image's data
-         * @param data data to embed
+         * Pack data to image using 2 LSB bits per image byte (MSB-first, packed pairs).
+         * First part (meta) uses 1-bit mode to avoid overflow.
+         * @param image image's data (modified in place)
+         * @param data data to embed (const, for safety)
+         * @param img_bytes total image bytes (for bound check)
          */
-        void lsb_two_bit(byte* image, std::vector<byte>& data);
+        void lsb_two_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes);
 
         std::unique_ptr<EmbedData> embed_data;
     public:
