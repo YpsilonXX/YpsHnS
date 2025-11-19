@@ -1,5 +1,5 @@
 #include "HnS.hh"
-
+#include "PhotoHnS/PhotoHnS.hh"
 #include <iostream>
 
 namespace Yps
@@ -36,6 +36,34 @@ std::optional<std::string> HnS::validate_path(const std::string& path)
 
 }
 
+std::optional<MetaData> HnS::readMetaOnly(const std::string& path)
+{
+    auto ext_opt = validate_path(path);
+    if (!ext_opt) {
+        return std::nullopt;
+    }
+    const std::string ext = ext_opt.value();
+
+    // PHOTO — поддерживаем PNG и JPEG
+    if (ext == "png" || ext == "jpg" || ext == "jpeg") {
+        PhotoHnS photo;
+        return photo.tryReadMetaOnly(path);
+    }
+
+    // VIDEO — в будущем
+    // if (ext == "mp4" || ext == "mkv" || ext == "avi") {
+    //     VideoHnS video;
+    //     return video.tryReadMetaOnly(path);
+    // }
+
+    // AUDIO — в будущем
+    // if (ext == "wav" || ext == "flac" || ext == "mp3") {
+    //     AudioHnS audio;
+    //     return audio.tryReadMetaOnly(path);
+    // }
+
+    return std::nullopt;
+}
 
 
 } // Yps

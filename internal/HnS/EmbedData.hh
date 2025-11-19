@@ -1,102 +1,54 @@
-//
-// Created by ypsilon on 10/7/25.
-//
-
 #ifndef YPSHNS_EMBEDDATA_HH
 #define YPSHNS_EMBEDDATA_HH
 
 #include <vector>
-#include <string>
 #include <array>
-#include <optional>
 #include <cstdint>
-#include <memory>
-#include <algorithm>
+#include <cstring>
 #include <defines.hh>
-#include <openssl/sha.h>
+#include "Encryption.hh"
 
 namespace Yps
 {
-    enum class ContainerType
+    enum class ContainerType : uint8_t
     {
         UNKNOWN, PHOTO, VIDEO, AUDIO
     };
 
-    enum class Extension
+    enum class Extension : uint8_t
     {
         JPEG, PNG
     };
 
-    enum class LsbMode {
+    enum class LsbMode : uint8_t
+    {
         OneBit,
         TwoBits,
         NoUsed
     };
 
+    // Fully POD-compatible structure — safe for memcpy
     struct MetaData
     {
-        /**
-         * Type of container
-         */
-        ContainerType container;
+        ContainerType container = ContainerType::UNKNOWN;
+        Extension     ext       = Extension::JPEG;
+        uint64_t      write_size = 0;           // Total size: metadata + encrypted payload
+        LsbMode       lsb_mode   = LsbMode::NoUsed;
+        uint32_t      meta_size  = sizeof(MetaData);  // Fixed size
 
-        /**
-         * Container's extension
-         */
-        Extension ext;
-
-        /**
-         * Name of plain(to embed) file
-         */
-        std::string filename;
-
-        /**
-         * Size of all written path (meta + plain)
-         */
-        uint64_t write_size;
-
-        /**
-         * Type of written lsb_mode
-         */
-        LsbMode lsb_mode{LsbMode::NoUsed};
-
-        /**
-         * Size of meta_data
-         */
-        const uint32_t meta_size = sizeof(MetaData);
+        // Fixed-size buffer for embedded file name (supports long paths, UTF-8)
+        char          filename[1024] = {0};
     };
-
 
     struct EmbedData
     {
-        EmbedData() = default;
-        ~EmbedData() = default;
-
-        /**
-         * Raw Data
-         */
         std::vector<byte> plain_data;
-        /**
-         * Encrypted Data
-         */
         std::vector<byte> encrypt_data;
-
-        /**
-         * Metadata to embed with plain data
-         */
-        MetaData meta;
-
-        /**
-         * Max size of data to embed
-         */
-        uint64_t max_capacity{};
-
-        /**
-         * Key for cryptography
-         */
+        MetaData          meta;
+        uint64_t          max_capacity{};
         std::array<byte, SHA256_DIGEST_LENGTH> key;
     };
 
-}
+} // namespace Yps
 
-#endif //YPSHNS_EMBEDDATA_HH
+#endif // YPSHNS_EMBEDDATA_HH

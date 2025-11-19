@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include "EmbedData.hh"
 
 #include <defines.hh>
 
@@ -40,6 +41,10 @@ namespace Yps
          * @return vector with bytes or std::nullopt, if failed
          */
         virtual std::optional<std::vector<byte>> extract(const std::string& path) = 0;
+
+        virtual std::optional<MetaData> tryReadMetaOnly(const std::string& path) = 0;
+
+        virtual std::optional<MetaData> readMetaOnly(const std::string& path);
     };
 } // Yps
 

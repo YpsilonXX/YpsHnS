@@ -117,12 +117,11 @@ namespace Yps
                                                         const jpeg_decompress_struct& cinfo,
                                                         uint64_t data_bytes) const;
 
-        std::unique_ptr<EmbedData> embed_data;  // Контекст: plain/encrypt/meta/key.
 
     public:
         ~PhotoHnS() = default;
         PhotoHnS() = default;
-
+        std::unique_ptr<EmbedData> embed_data;  // Контекст: plain/encrypt/meta/key.
         /**
          * Embed данных в фото (PNG/JPEG auto-detect).
          * @param data Данные для скрытия.
@@ -139,6 +138,8 @@ namespace Yps
          * @return plain_data или nullopt (fail: no meta/invalid).
          */
         std::optional<std::vector<byte>> extract(const std::string& path) override;
+
+        std::optional<MetaData> tryReadMetaOnly(const std::string& path) override;
     };
 } // Yps
 

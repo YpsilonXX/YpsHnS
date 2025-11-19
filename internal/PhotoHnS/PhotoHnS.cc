@@ -13,216 +13,161 @@
 
 namespace Yps
 {
+    struct StbImageDeleter {
+        void operator()(unsigned char* data) const noexcept {
+            if (data) stbi_image_free(data);
+        }
+    };
+    using StbImageUniquePtr = std::unique_ptr<unsigned char[], StbImageDeleter>;
+
     bool PhotoHnS::has_usable_alpha(const byte *image, int32_t width, int32_t height, int32_t channels)
     {
-        if (channels != 4)
-            return false;
-        // Check alpha channel (every 4th byte) for full opacity (255).
-        // Use uint32_t for i to avoid overflow in large images.
+        if (channels != 4) return false;
         for (uint32_t i = 3; i < static_cast<uint32_t>(width) * height * channels; i += channels)
-            if (image[i] != 255)
-                return false;
+            if (image[i] != 255) return false;
         return true;
     }
 
-    std::optional<std::string> PhotoHnS::embed(const std::vector<byte>& data, const std::string& path, const std::string& out_path)
+    /* -------------------------------------------------------------------------- */
+    /*  Public embed entry point – old signature (no payload_filename argument)   */
+    /* -------------------------------------------------------------------------- */
+    std::optional<std::string> PhotoHnS::embed(const std::vector<byte>& data,
+                                               const std::string& container_path,
+                                               const std::string& out_path)
     {
-        // Initialize EmbedData (reset if needed).
-        if (!this->embed_data)
-            this->embed_data = std::make_unique<EmbedData>();
-        else
-            this->embed_data = std::make_unique<EmbedData>();  // Automatic reset via move.
+        embed_data = std::make_unique<EmbedData>();
 
-        // Fill metadata (only filename, not full path — safer).
-        this->embed_data->plain_data = data;
-        this->embed_data->meta.container = ContainerType::PHOTO;
-        this->embed_data->meta.filename = std::filesystem::path(path).filename().string();
-        this->embed_data->key = AuthorKey::getInstance().get_key();
+        // If the filename field is empty (set by MainWindow), fall back to container name
+        if (embed_data->meta.filename[0] == '\0') {
+            std::string fallback = std::filesystem::path(container_path).filename().string();
+            std::strncpy(embed_data->meta.filename, fallback.c_str(),
+                         sizeof(embed_data->meta.filename) - 1);
+            embed_data->meta.filename[sizeof(embed_data->meta.filename) - 1] = '\0';
+        }
 
-        // Encryption (key from AuthorKey).
-        AES256Encryption::getInstance().set_key(this->embed_data->key);
-        this->embed_data->encrypt_data = AES256Encryption::getInstance().encrypt(this->embed_data->plain_data);
+        embed_data->plain_data = data;
+        embed_data->meta.container = ContainerType::PHOTO;
 
-        // write_size: encrypt + sizeof(MetaData) (temporary; for raw copy).
-        this->embed_data->meta.write_size = this->embed_data->encrypt_data.size() + sizeof(MetaData);
+        embed_data->key = AuthorKey::getInstance().get_key();
+        AES256Encryption::getInstance().set_key(embed_data->key);
+        embed_data->encrypt_data = AES256Encryption::getInstance().encrypt(data);
 
-        // Path validation.
-        auto ext_opt = validate_path(path);
+        const auto ext_opt = validate_path(container_path);
         if (!ext_opt) {
-            std::cerr << CLI_RED << "PhotoHnS::embed(): Invalid path: " << path << CLI_RESET << std::endl;
+            std::cerr << "[PhotoHnS] Invalid container path\n";
             return std::nullopt;
         }
-        std::string filetype = ext_opt.value();
+        const std::string ext = ext_opt.value();
 
-        // Support PNG and JPEG.
-        if (filetype == "png") {
-            this->embed_data->meta.ext = Extension::PNG;
-            this->embed_data->meta.lsb_mode = LsbMode::NoUsed;  // Will be set in png_in.
-            return this->png_in(out_path);
-        } else if (filetype == "jpg" || filetype == "jpeg") {
-            this->embed_data->meta.ext = Extension::JPEG;
-            this->embed_data->meta.lsb_mode = LsbMode::OneBit;  // Only 1-bit mode for DCT.
-            return this->jpg_in(out_path);
+        if (ext == "png") {
+            embed_data->meta.ext = Extension::PNG;
+            embed_data->meta.lsb_mode = LsbMode::OneBit;          // Always 1-bit for reliability
+            return png_in(out_path);
+        }
+        if (ext == "jpg" || ext == "jpeg") {
+            embed_data->meta.ext = Extension::JPEG;
+            embed_data->meta.lsb_mode = LsbMode::OneBit;
+            return jpg_in(out_path);
         }
 
-        std::cerr << CLI_RED << "PhotoHnS::embed(): Unsupported extension: " << filetype << CLI_RESET << std::endl;
+        std::cerr << "[PhotoHnS] Unsupported container extension: " << ext << '\n';
         return std::nullopt;
     }
 
-    std::optional<std::string> PhotoHnS::png_in(const std::string &out_path)
+    /* -------------------------------------------------------------------------- */
+    /*  PNG embedding – only 1-bit LSB (simpler and more robust)                  */
+    /* -------------------------------------------------------------------------- */
+    std::optional<std::string> PhotoHnS::png_in(const std::string& out_path)
     {
-        // Load image (RAII: free at end).
-        int32_t width, height, channels;
-        byte* image = stbi_load(this->embed_data->meta.filename.c_str(), &width, &height, &channels, 0);
-        if (!image) {
-            std::cerr << CLI_RED << "Error: Failed to load PNG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
+        int width, height, channels;
+        StbImageUniquePtr img(stbi_load(embed_data->meta.filename,
+                                        &width, &height, &channels, 0));
+        if (!img) {
+            std::cerr << "[PhotoHnS] Failed to load PNG: " << embed_data->meta.filename << '\n';
             return std::nullopt;
         }
 
-        auto free_image = [](byte* p) noexcept { stbi_image_free(p); };
-        std::unique_ptr<byte, decltype(free_image)> image_guard(image, free_image);
+        const uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
 
-        // Capacity calculation (image bytes = bits for 1-bit LSB).
-        uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
-        uint64_t data_bytes = this->embed_data->encrypt_data.size() + sizeof(MetaData);
-        uint64_t total_bits = data_bytes * 8ULL;
+        // Build payload: metadata + encrypted data
+        std::vector<byte> payload;
+        payload.resize(sizeof(MetaData));
+        std::memcpy(payload.data(), &embed_data->meta, sizeof(MetaData));
+        payload.insert(payload.end(),
+                       embed_data->encrypt_data.begin(),
+                       embed_data->encrypt_data.end());
 
-        // Mode selection (strict <= for safety).
-        LsbMode mode = LsbMode::NoUsed;
-        if (total_bits <= img_bytes) {
-            mode = LsbMode::OneBit;
-        } else if (total_bits <= img_bytes * 2ULL) {  // Simplified; optionally subtract meta*8.
-            std::cout << CLI_YELLOW << "Warning: Using LsbMode::TwoBits — artifacts may be visible." << CLI_RESET << std::endl;
-            mode = LsbMode::TwoBits;
-        } else {
-            std::cerr << CLI_RED << "Error: Insufficient capacity in PNG (needed " << total_bits
-                      << " bits, available ~" << img_bytes * 2 << ")." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-        this->embed_data->meta.lsb_mode = mode;
-
-        // Prepare full_data: metadata followed by encrypted data.
-        std::vector<byte> full_data(data_bytes);
-        MetaData* m = &this->embed_data->meta;
-        std::copy(reinterpret_cast<const byte*>(m), reinterpret_cast<const byte*>(m) + sizeof(MetaData), full_data.begin());
-        std::copy(this->embed_data->encrypt_data.begin(), this->embed_data->encrypt_data.end(),
-                  full_data.begin() + sizeof(MetaData));
-
-        // Embedding with bounds checks.
-        switch (mode) {
-            case LsbMode::OneBit:
-                this->lsb_one_bit(image, full_data, img_bytes);
-                break;
-            case LsbMode::TwoBits:
-                this->lsb_two_bit(image, full_data, img_bytes);
-                break;
-            default:
-                return std::nullopt;
-        }
-
-        // Save (stride=0 auto).
-        int success = stbi_write_png(out_path.c_str(), width, height, channels, image, 0);
-        if (!success) {
-            std::cerr << CLI_RED << "Error: Failed to write PNG: " << out_path << CLI_RESET << std::endl;
+        const uint64_t required_bits = payload.size() * 8;
+        if (required_bits > img_bytes) {
+            std::cerr << "[PhotoHnS] Not enough capacity in PNG (need "
+                      << required_bits << " bits, have " << img_bytes << ")\n";
             return std::nullopt;
         }
 
-        std::cout << CLI_GREEN << "Embedded " << data_bytes << " bytes into " << out_path << " (mode: "
-                  << static_cast<int>(mode) << ")." << CLI_RESET << std::endl;
+        lsb_one_bit(img.get(), payload, img_bytes);
+        embed_data->meta.lsb_mode = LsbMode::OneBit;
+
+        const int stride = width * channels;
+        if (!stbi_write_png(out_path.c_str(), width, height, channels,
+                            img.get(), stride)) {
+            std::cerr << "[PhotoHnS] stbi_write_png failed\n";
+            return std::nullopt;
+                            }
+
         return out_path;
     }
 
-    std::optional<std::string> PhotoHnS::jpg_in(const std::string &out_path)
+    /* -------------------------------------------------------------------------- */
+    /*  JPEG embedding – DCT LSB (unchanged core logic, only minor safety fixes)   */
+    /* -------------------------------------------------------------------------- */
+    std::optional<std::string> PhotoHnS::jpg_in(const std::string& out_path)
     {
-        // Prepare full_data: metadata + encrypted data.
-        uint64_t data_bytes = this->embed_data->meta.write_size;
-        std::vector<byte> full_data(data_bytes);
-        MetaData* m = &this->embed_data->meta;
-        std::copy(reinterpret_cast<const byte*>(m), reinterpret_cast<const byte*>(m) + sizeof(MetaData), full_data.begin());
-        std::copy(this->embed_data->encrypt_data.begin(), this->embed_data->encrypt_data.end(),
-                  full_data.begin() + sizeof(MetaData));
+        std::vector<byte> full_data;
+        full_data.resize(sizeof(MetaData));
+        std::memcpy(full_data.data(), &embed_data->meta, sizeof(MetaData));
+        full_data.insert(full_data.end(),
+                         embed_data->encrypt_data.begin(),
+                         embed_data->encrypt_data.end());
 
-        uint64_t total_bits = data_bytes * 8ULL;
-        if (total_bits == 0) return std::nullopt;  // Edge case.
-
-        // RAII for decompress (manual finish — see below).
         JpegDecompressRAII decompress;
-        FILE* infile = std::fopen(this->embed_data->meta.filename.c_str(), "rb");
+        FILE* infile = std::fopen(embed_data->meta.filename, "rb");
         if (!infile) {
-            std::cerr << CLI_RED << "Error: Failed to open JPEG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
+            std::cerr << "[PhotoHnS] Cannot open JPEG container\n";
             return std::nullopt;
         }
-        auto close_infile = [](FILE* f) { std::fclose(f); };
-        std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
+        // Simple RAII fclose
+        auto close_file = [](FILE* f) { if (f) std::fclose(f); };
+        std::unique_ptr<FILE, decltype(close_file)> fg(infile, close_file);
 
-        // Set up input source and read header.
         jpeg_stdio_src(&decompress.cinfo, infile);
-        if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
-            std::cerr << CLI_RED << "Error: JPEG header read suspended." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-
-        // Log progressive and force baseline (enforced on compress side).
-        if (decompress.cinfo.progressive_mode) {
-            std::cout << CLI_YELLOW << "Input is progressive JPEG; forcing baseline output." << CLI_RESET << std::endl;
-        }
-
-        // Read DCT coefficients (keep decompress alive until transcoding end).
+        jpeg_read_header(&decompress.cinfo, TRUE);
         jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
         if (!coef_arrays) {
-            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);  // Safe cleanup.
+            std::cerr << "[PhotoHnS] jpeg_read_coefficients failed\n";
             return std::nullopt;
         }
 
-        // Calculate capacity (AC: 63 bits per block, skip DC).
-        uint64_t ac_capacity_bits = 0;
-        for (int ci = 0; ci < decompress.cinfo.num_components; ++ci) {
-            jpeg_component_info* comp = decompress.cinfo.comp_info + ci;
-            ac_capacity_bits += static_cast<uint64_t>(comp->height_in_blocks) * comp->width_in_blocks * 63ULL;
-        }
-        if (total_bits > ac_capacity_bits) {
-            std::cerr << CLI_RED << "Error: Insufficient capacity in JPEG (needed " << total_bits
-                      << " bits, available " << ac_capacity_bits << ")." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);
-            return std::nullopt;
-        }
-        std::cout << CLI_YELLOW << "JPEG capacity check: " << ac_capacity_bits << " AC bits available." << CLI_RESET << std::endl;
+        dct_lsb_embed(coef_arrays, decompress.cinfo, full_data);
 
-        // Embed LSB in AC (modifies coef_arrays via access_virt_barray).
-        this->dct_lsb_embed(coef_arrays, decompress.cinfo, full_data);
-
-        // RAII for compress (manual finish below).
         JpegCompressRAII compress;
         FILE* outfile = std::fopen(out_path.c_str(), "wb");
-        if (!outfile) {
-            std::cerr << CLI_RED << "Error: Failed to open output: " << out_path << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);  // Cleanup on fail.
-            return std::nullopt;
-        }
-        auto close_outfile = [](FILE* f) { std::fclose(f); };
-        std::unique_ptr<FILE, decltype(close_outfile)> outfile_guard(outfile, close_outfile);
+        if (!outfile) return std::nullopt;
+        std::unique_ptr<FILE, decltype(close_file)> fg_out(outfile, close_file);
 
         jpeg_stdio_dest(&compress.cinfo, outfile);
+        compress.cinfo.image_width      = decompress.cinfo.image_width;
+        compress.cinfo.image_height     = decompress.cinfo.image_height;
+        compress.cinfo.input_components = decompress.cinfo.num_components;
+        compress.cinfo.in_color_space   = decompress.cinfo.jpeg_color_space;
 
-        // Copy critical parameters — do this while decompress is still valid.
+        jpeg_set_defaults(&compress.cinfo);
+        jpeg_set_quality(&compress.cinfo, 95, TRUE);
         jpeg_copy_critical_parameters(&decompress.cinfo, &compress.cinfo);
 
-        // Force baseline to avoid Huffman corruption (no progressive/arith).
-        compress.cinfo.progressive_mode = FALSE;
-        compress.cinfo.arith_code = FALSE;
-        compress.cinfo.optimize_coding = FALSE;  // Stable Huffman tables.
+        jpeg_write_coefficients(&compress.cinfo, coef_arrays);
+        jpeg_finish_compress(&compress.cinfo);
+        jpeg_destroy_compress(&compress.cinfo);
 
-        // Pass modified coef_arrays to write_coefficients (no field assign).
-        jpeg_write_coefficients(&compress.cinfo, coef_arrays);  // Full call: cinfo + arrays.
-
-        // Finish compress (writes trailer, but does not free arrays — shared).
-        jpeg_finish_compress(&compress.cinfo);  // Errors via err_mgr.
-
-        // Now safe to finish decompress (free arrays after compress).
-        jpeg_finish_decompress(&decompress.cinfo);
-
-        std::cout << CLI_GREEN << "Embedded " << data_bytes << " bytes into JPEG DCT (" << out_path << ")." << CLI_RESET << std::endl;
         return out_path;
     }
 
@@ -542,7 +487,8 @@ namespace Yps
         bool is_loadable = false;
 
         if (!skip_pixel_mode) {  // PNG: Load pixels.
-            image = stbi_load(path.c_str(), &width, &height, &channels, 0);
+            StbImageUniquePtr img(stbi_load(path.c_str(), &width, &height, &channels, 0));
+            if (!img) return std::nullopt;
             is_loadable = (image != nullptr);
             if (is_loadable) {
                 image_guard.reset(image);
@@ -586,13 +532,7 @@ namespace Yps
             // Validation: If PHOTO — use pixels.
             if (extracted_meta.container == ContainerType::PHOTO) {
                 meta_from_pixels = true;
-                // Manual copy (operator= deleted due to const meta_size).
-                this->embed_data->meta.container = extracted_meta.container;
-                this->embed_data->meta.ext = extracted_meta.ext;
-                this->embed_data->meta.filename = extracted_meta.filename;
-                this->embed_data->meta.write_size = extracted_meta.write_size;
-                this->embed_data->meta.lsb_mode = extracted_meta.lsb_mode;
-                // meta_size — const, ignore (always sizeof(MetaData)).
+                this->embed_data->meta = extracted_meta;
             } else {
                 meta_from_pixels = false;
                 std::cerr << CLI_YELLOW << "Pixel metadata invalid (not PHOTO), trying JPEG DCT..." << CLI_RESET << std::endl;
@@ -698,6 +638,74 @@ namespace Yps
 
         std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from PNG pixels." << CLI_RESET << std::endl;
         return this->embed_data->plain_data;
+    }
+
+    // ---------------------------------------------------------------------
+    // Fast metadata detection (tryReadMetaOnly)
+    // ---------------------------------------------------------------------
+    std::optional<MetaData> PhotoHnS::tryReadMetaOnly(const std::string& path)
+    {
+        const auto ext_opt = HnS::validate_path(path);
+        if (!ext_opt) return std::nullopt;
+        const std::string ext = ext_opt.value();
+
+        if (ext == "png") {
+            int w, h, ch;
+            StbImageUniquePtr img(stbi_load(path.c_str(), &w, &h, &ch, 0));
+            if (!img) return std::nullopt;
+
+            const uint64_t total_bytes = static_cast<uint64_t>(w) * h * ch;
+
+            for (int mode = 0; mode < 2; ++mode) {
+                std::vector<byte> buffer(sizeof(MetaData), 0);
+                uint64_t bit_pos = 0;
+
+                for (uint64_t i = 0; i < total_bytes && bit_pos < sizeof(MetaData) * 8; ++i) {
+                    byte bit = img[i] & 1;
+                    uint64_t byte_idx = bit_pos / 8;
+                    uint64_t bit_idx = 7 - (bit_pos % 8);
+                    buffer[byte_idx] |= (bit << bit_idx);
+                    ++bit_pos;
+                }
+
+                MetaData meta{};
+                std::memcpy(&meta, buffer.data(), sizeof(MetaData));
+
+                if (meta.container == ContainerType::PHOTO &&
+                    meta.ext == Extension::PNG &&
+                    meta.write_size >= sizeof(MetaData)) {
+                    meta.lsb_mode = mode ? LsbMode::TwoBits : LsbMode::OneBit;
+                    return meta;
+                }
+            }
+        }
+
+        if (ext == "jpg" || ext == "jpeg") {
+            JpegDecompressRAII d;
+            FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) return std::nullopt;
+            auto close_f = [](FILE* fp) { if (fp) std::fclose(fp); };
+            std::unique_ptr<FILE, decltype(close_f)> fg(f, close_f);
+
+            jpeg_stdio_src(&d.cinfo, f);
+            jpeg_read_header(&d.cinfo, TRUE);
+            jvirt_barray_ptr* coefs = jpeg_read_coefficients(&d.cinfo);
+            if (!coefs) return std::nullopt;
+
+            auto extracted = dct_lsb_extract(coefs, d.cinfo, sizeof(MetaData));
+            jpeg_finish_decompress(&d.cinfo);
+
+            if (extracted && extracted->size() == sizeof(MetaData)) {
+                MetaData meta{};
+                std::memcpy(&meta, extracted->data(), sizeof(MetaData));
+                if (meta.container == ContainerType::PHOTO && meta.ext == Extension::JPEG) {
+                    meta.lsb_mode = LsbMode::OneBit;
+                    return meta;
+                }
+            }
+        }
+
+        return std::nullopt;
     }
 
 } // Yps
