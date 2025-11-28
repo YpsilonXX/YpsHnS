@@ -35,15 +35,13 @@ namespace Yps
                                                const std::string& container_path,
                                                const std::string& out_path)
     {
-        embed_data = std::make_unique<EmbedData>();
-
-        // If the filename field is empty (set by MainWindow), fall back to container name
-        if (embed_data->meta.filename[0] == '\0') {
-            std::string fallback = std::filesystem::path(container_path).filename().string();
-            std::strncpy(embed_data->meta.filename, fallback.c_str(),
-                         sizeof(embed_data->meta.filename) - 1);
-            embed_data->meta.filename[sizeof(embed_data->meta.filename) - 1] = '\0';
+        // Create embed_data only if not pre-set by caller (e.g., GUI for meta.filename)
+        if (!embed_data) {
+            embed_data = std::make_unique<EmbedData>();
         }
+
+        // Store full container path for loading in png_in/jpg_in
+        embed_data->container_full_path = container_path;
 
         embed_data->plain_data = data;
         embed_data->meta.container = ContainerType::PHOTO;
@@ -97,10 +95,9 @@ namespace Yps
                        embed_data->encrypt_data.begin(),
                        embed_data->encrypt_data.end());
 
-        const uint64_t required_bits = payload.size() * 8;
-        if (required_bits > img_bytes) {
+        if (payload.size() * 8 > img_bytes) {
             std::cerr << "[PhotoHnS] Not enough capacity in PNG (need "
-                      << required_bits << " bits, have " << img_bytes << ")\n";
+                      << payload.size() * 8 << " bits, have " << img_bytes << ")\n";
             return std::nullopt;
         }
 
@@ -122,49 +119,48 @@ namespace Yps
     /* -------------------------------------------------------------------------- */
     std::optional<std::string> PhotoHnS::jpg_in(const std::string& out_path)
     {
-        std::vector<byte> full_data;
-        full_data.resize(sizeof(MetaData));
-        std::memcpy(full_data.data(), &embed_data->meta, sizeof(MetaData));
-        full_data.insert(full_data.end(),
-                         embed_data->encrypt_data.begin(),
-                         embed_data->encrypt_data.end());
-
-        JpegDecompressRAII decompress;
-        FILE* infile = std::fopen(embed_data->meta.filename, "rb");
-        if (!infile) {
-            std::cerr << "[PhotoHnS] Cannot open JPEG container\n";
+        JpegDecompressRAII d;
+        FILE* in_file = std::fopen(embed_data->container_full_path.c_str(), "rb");
+        if (!in_file) {
+            std::cerr << "[PhotoHnS] Failed to open JPEG from: " << embed_data->container_full_path << '\n';
             return std::nullopt;
         }
-        // Simple RAII fclose
-        auto close_file = [](FILE* f) { if (f) std::fclose(f); };
-        std::unique_ptr<FILE, decltype(close_file)> fg(infile, close_file);
+        auto close_in = [](FILE* fp) { if (fp) std::fclose(fp); };
+        std::unique_ptr<FILE, decltype(close_in)> in_guard(in_file, close_in);
 
-        jpeg_stdio_src(&decompress.cinfo, infile);
-        jpeg_read_header(&decompress.cinfo, TRUE);
-        jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
-        if (!coef_arrays) {
-            std::cerr << "[PhotoHnS] jpeg_read_coefficients failed\n";
+        jpeg_stdio_src(&d.cinfo, in_file);
+        jpeg_read_header(&d.cinfo, TRUE);
+        jvirt_barray_ptr* coefs = jpeg_read_coefficients(&d.cinfo);
+        if (!coefs) {
+            std::cerr << "[PhotoHnS] Failed to read JPEG coefficients\n";
             return std::nullopt;
         }
 
-        dct_lsb_embed(coef_arrays, decompress.cinfo, full_data);
+        // Build payload (similar to PNG)
+        std::vector<byte> payload;
+        payload.resize(sizeof(MetaData));
+        std::memcpy(payload.data(), &embed_data->meta, sizeof(MetaData));
+        payload.insert(payload.end(), embed_data->encrypt_data.begin(), embed_data->encrypt_data.end());
+
+        dct_lsb_embed(coefs, d.cinfo, payload);
 
         JpegCompressRAII compress;
         FILE* outfile = std::fopen(out_path.c_str(), "wb");
         if (!outfile) return std::nullopt;
+        auto close_file = [](FILE* f) { if (f) std::fclose(f); };
         std::unique_ptr<FILE, decltype(close_file)> fg_out(outfile, close_file);
 
         jpeg_stdio_dest(&compress.cinfo, outfile);
-        compress.cinfo.image_width      = decompress.cinfo.image_width;
-        compress.cinfo.image_height     = decompress.cinfo.image_height;
-        compress.cinfo.input_components = decompress.cinfo.num_components;
-        compress.cinfo.in_color_space   = decompress.cinfo.jpeg_color_space;
+        compress.cinfo.image_width      = d.cinfo.image_width;
+        compress.cinfo.image_height     = d.cinfo.image_height;
+        compress.cinfo.input_components = d.cinfo.num_components;
+        compress.cinfo.in_color_space   = d.cinfo.jpeg_color_space;
 
         jpeg_set_defaults(&compress.cinfo);
         jpeg_set_quality(&compress.cinfo, 95, TRUE);
-        jpeg_copy_critical_parameters(&decompress.cinfo, &compress.cinfo);
+        jpeg_copy_critical_parameters(&d.cinfo, &compress.cinfo);
 
-        jpeg_write_coefficients(&compress.cinfo, coef_arrays);
+        jpeg_write_coefficients(&compress.cinfo, coefs);
         jpeg_finish_compress(&compress.cinfo);
         jpeg_destroy_compress(&compress.cinfo);
 

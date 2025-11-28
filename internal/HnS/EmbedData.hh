@@ -47,6 +47,7 @@ namespace Yps
         MetaData          meta;
         uint64_t          max_capacity{};
         std::array<byte, SHA256_DIGEST_LENGTH> key;
+        std::string container_full_path;
     };
 
 } // namespace Yps

@@ -119,24 +119,18 @@ namespace Yps
 
     void MainWindow::openContainer()
     {
-        QString path = QFileDialog::getOpenFileName(this,
-            "Открыть контейнер", "", "Images (*.png *.jpg *.jpeg)");
+        QString path = QFileDialog::getOpenFileName(this, "Открыть контейнер", "", "Images (*.png *.jpg *.jpeg)");
         if (path.isEmpty()) return;
 
-        clearAll();
+        hns->embed_data.reset();  // чистим старое состояние
+
         currentContainerPath = path;
         containerPathEdit->setText(path);
         loadPreview(path);
 
-        // Пробуем извлечь только метаданные (быстро, без полного extract)
-        // Мы делаем лёгкий «пробный» extract: читаем первые sizeof(MetaData) байт LSB/DCT
-        // (я добавил вспомогательный приватный метод в PhotoHnS — см. ниже)
-        currentMeta = hns->tryReadMetaOnly(path.toStdString());
-
-        updateMetaInfo(currentMeta);
-
-        // Включаем кнопку извлечения только если действительно есть внедрённые данные
-        findChild<QPushButton*>("extractBtn")->setEnabled(currentMeta.has_value());
+        auto meta = hns->tryReadMetaOnly(path.toStdString());
+        updateMetaInfo(meta);  // ← теперь безопасно
+        currentMeta = meta;
     }
 
     void MainWindow::loadPreview(const QString& path)
@@ -149,21 +143,24 @@ namespace Yps
         previewLabel->setPixmap(pix.scaled(previewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }
 
-    void MainWindow::updateMetaInfo(const std::optional<Yps::MetaData>& meta)
+    void MainWindow::updateMetaInfo(const std::optional<Yps::MetaData>& meta_opt)
     {
-        if (!meta) {
-            metaLabel->setText("Метаданные: нет внедрённых данных");
+        if (!meta_opt.has_value()) {
+            metaLabel->setText("Метаданные: нет");
+            currentMeta.reset();
             return;
         }
 
+        const auto& meta = meta_opt.value();  // ← теперь безопасно
+
         std::ostringstream oss;
-        oss << "Обнаружены внедрённые данные:\n"
-            << "Имя файла: " << meta->filename << "\n"
-            << "Размер данных: " << (meta->write_size - sizeof(Yps::MetaData)) << " байт\n"
-            << "LSB-режим: " << (meta->lsb_mode == Yps::LsbMode::OneBit ? "1 бит" : "2 бита") << "\n"
-            << "Контейнер: " << (meta->ext == Yps::Extension::PNG ? "PNG" : "JPEG");
+        oss << "Размер внедрённых данных: " << (meta.write_size - sizeof(Yps::MetaData)) << " байт\n"
+            << "Имя файла: " << (meta.filename[0] ? meta.filename : "<без имени>") << "\n"
+            << "Режим LSB: " << (meta.lsb_mode == Yps::LsbMode::OneBit ? "1 бит" : "2 бита") << "\n"
+            << "Контейнер: " << (meta.ext == Yps::Extension::PNG ? "PNG" : "JPEG");
 
         metaLabel->setText(QString::fromStdString(oss.str()));
+        currentMeta = meta_opt;  // сохраняем целиком
     }
 
     void MainWindow::embedFile()
@@ -173,7 +170,7 @@ namespace Yps
             return;
         }
 
-        // Читаем файл
+        // Read payload
         QFile file(payloadPathEdit->text());
         if (!file.open(QIODevice::ReadOnly)) {
             QMessageBox::critical(this, "Error", "Cannot read file");
@@ -188,22 +185,25 @@ namespace Yps
         QString savePath = QFileDialog::getSaveFileName(this, "Save container", "", "Images (*.png *.jpg *.jpeg)");
         if (savePath.isEmpty()) return;
 
-        // КЛЮЧЕВОЙ МОМЕНТ:
-        // Мы временно "подменяем" hns, чтобы передать имя файла "изнутри"
-        // Это безопасно, потому что embed_data — это internal состояние
-        hns->embed_data = std::make_unique<EmbedData>();  // сбрасываем
-        std::strncpy(hns->embed_data->meta.filename,
-                     QFileInfo(payloadPathEdit->text()).fileName().toUtf8().constData(),
+        // Pre-create embed_data here so embed() reuses it
+        hns->embed_data = std::make_unique<EmbedData>();
+
+        // Set payload filename in meta
+        std::string payload_name = QFileInfo(payloadPathEdit->text()).fileName().toStdString();
+        std::strncpy(hns->embed_data->meta.filename, payload_name.c_str(),
                      sizeof(hns->embed_data->meta.filename) - 1);
         hns->embed_data->meta.filename[sizeof(hns->embed_data->meta.filename) - 1] = '\0';
 
-        // Теперь вызываем embed() со старой сигнатурой — имя уже "внутри"!
+        // Call embed (it will reuse embed_data and set container_full_path)
         auto result = hns->embed(data, currentContainerPath.toStdString(), savePath.toStdString());
 
         if (result) {
-            QMessageBox::information(this, "Success", "Data embedded successfully embedded!");
+            QMessageBox::information(this, "Success", "Data successfully embedded!");
+            hns->embed_data.reset();
             currentContainerPath = savePath;
             containerPathEdit->setText(savePath);
+            loadPreview(savePath);
+            updateMetaInfo(hns->tryReadMetaOnly(savePath.toStdString()));
             openContainer();
         } else {
             QMessageBox::critical(this, "Error", "Not enough capacity or file error");
