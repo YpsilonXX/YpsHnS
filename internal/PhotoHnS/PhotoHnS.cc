@@ -511,193 +511,169 @@ namespace Yps
     }
 
     std::optional<std::vector<byte>> PhotoHnS::extract(const std::string& path)
-    {
-        // Step 0: Initialize context (fail if none).
-        if (!this->embed_data) {
-            std::cerr << CLI_RED << "Error: No EmbedData context in extract." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
+{
+    // Always reset EmbedData for each extraction to avoid carrying over context from previous operations.
+    this->embed_data = std::make_unique<EmbedData>();
 
-        // Step 0.1: Set key (singleton, once — avoid duplicates).
-        this->embed_data->key = AuthorKey::getInstance().get_key();
+    this->embed_data->key = AuthorKey::getInstance().get_key();
 
-        // Step 0.2: Validate path and type (adaptive by ext).
-        auto ext_opt = validate_path(path);
-        if (!ext_opt) {
-            std::cerr << CLI_RED << "Error: Invalid path for extraction: " << path << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-        std::string filetype = ext_opt.value();
-        bool is_jpeg = (filetype == "jpg" || filetype == "jpeg");
-        bool skip_pixel_mode = is_jpeg;  // For JPEG: direct DCT, no stbi_load().
+    // Path validation.
+    auto ext_opt = validate_path(path);
+    if (!ext_opt) {
+        std::cerr << CLI_RED << "PhotoHnS::extract(): Invalid path: " << path << CLI_RESET << std::endl;
+        return std::nullopt;
+    }
+    std::string filetype = ext_opt.value();
 
-        // Step 1: Attempt pixel loading (only for PNG).
-        struct StbiDeleter {
-            void operator()(byte* p) const noexcept { stbi_image_free(p); }
-        };
-        std::unique_ptr<byte, StbiDeleter> image_guard;  // RAII: auto-free.
-        int32_t width = 0, height = 0, channels = 0;
-        byte* image = nullptr;
-        uint64_t img_bytes = 0;
-        bool is_loadable = false;
+    // Load image (RAII: free at end).
+    int32_t width, height, channels;
+    byte* image = stbi_load(path.c_str(), &width, &height, &channels, 0);
+    bool is_loadable = (image != nullptr);
+    auto free_image = [](byte* p) noexcept { stbi_image_free(p); };
+    std::unique_ptr<byte, decltype(free_image)> image_guard(image, free_image);
 
-        if (!skip_pixel_mode) {  // PNG: Load pixels.
-            image = stbi_load(path.c_str(), &width, &height, &channels, 0);
-            is_loadable = (image != nullptr);
-            if (is_loadable) {
-                image_guard.reset(image);
-                img_bytes = static_cast<uint64_t>(width) * height * channels;
+    // Step 1: Assume PNG pixels first (extract meta with 1-bit LSB).
+    bool meta_from_pixels = false;
+    bool dct_fallback_used = false;
+    if (is_loadable) {
+        uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
+
+        // Extract meta from pixels (always 1-bit for meta).
+        auto meta_opt = this->lsb_extract_meta(image, img_bytes);
+        if (meta_opt && meta_opt->size() == sizeof(MetaData)) {
+            std::copy(meta_opt->begin(), meta_opt->end(), reinterpret_cast<byte*>(&this->embed_data->meta));
+
+            // Validate meta.
+            if (this->embed_data->meta.container == ContainerType::PHOTO &&
+                (this->embed_data->meta.ext == Extension::PNG || this->embed_data->meta.ext == Extension::JPEG) &&
+                this->embed_data->meta.write_size > sizeof(MetaData) &&
+                this->embed_data->meta.meta_size == sizeof(MetaData)) {
+                meta_from_pixels = true;
+                std::cout << CLI_GREEN << "Valid metadata from pixels (size: " << this->embed_data->meta.write_size << ")." << CLI_RESET << std::endl;
+            } else {
+                std::cerr << CLI_YELLOW << "Pixel metadata invalid (not PHOTO), trying JPEG DCT..." << CLI_RESET << std::endl;
+                image_guard.reset();  // Free pixels early if not needed.
             }
         } else {
-            is_loadable = false;  // For JPEG: Simulate fail, proceed to fallback.
+            std::cerr << CLI_YELLOW << "Failed to extract metadata from pixels, trying JPEG DCT..." << CLI_RESET << std::endl;
         }
+    }
 
-        if (!is_loadable) {
-            // Silent for JPEG (no cerr); error only for PNG (real fail).
-            if (!skip_pixel_mode) {
-                std::cerr << CLI_RED << "Error: Failed to load image: " << path << " (stbi)." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-            // For JPEG: Quietly skip (fallback will handle).
+    // Step 2: Fallback to DCT for JPEG (if not meta_from_pixels).
+    if (!meta_from_pixels) {
+        dct_fallback_used = true;
+        JpegDecompressRAII decompress;
+        FILE* infile = std::fopen(path.c_str(), "rb");
+        if (!infile) {
+            std::cerr << CLI_RED << "Error: Failed to open for JPEG fallback: " << path << CLI_RESET << std::endl;
+            return std::nullopt;
         }
+        auto close_infile = [](FILE* f) { std::fclose(f); };
+        std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
 
-        // Step 2: Extract metadata (from pixels if loaded).
-        MetaData extracted_meta{};  // Local for validation.
-        bool meta_from_pixels = false;
-        bool dct_fallback_used = false;  // Flag: fallback processed?
-        if (is_loadable && img_bytes >= sizeof(MetaData) * 8ULL) {
-            // LSB 1-bit from first bytes (MSB-first).
-            size_t meta_byte_size = sizeof(MetaData);
-            std::vector<byte> meta_bytes(meta_byte_size, 0);
-            size_t bit_pos = 0;
-            for (size_t i = 0; i < meta_byte_size * 8ULL; ++i) {
-                if (i >= img_bytes) break;  // Bounds-check.
-
-                byte bit = image[i] & 0x01;
-                size_t byte_idx = bit_pos / 8;
-                size_t bit_offset = bit_pos % 8;
-                meta_bytes[byte_idx] |= (bit << (7 - bit_offset));
-                ++bit_pos;
-            }
-
-            // Copy to extracted_meta.
-            std::copy(meta_bytes.begin(), meta_bytes.end(), reinterpret_cast<byte*>(&extracted_meta));
-
-            // Validation: If PHOTO — use pixels.
-            if (extracted_meta.container == ContainerType::PHOTO) {
-                meta_from_pixels = true;
-                // Manual copy (operator= deleted due to const meta_size).
-                this->embed_data->meta.container = extracted_meta.container;
-                this->embed_data->meta.ext = extracted_meta.ext;
-                this->embed_data->meta.filename = extracted_meta.filename;
-                this->embed_data->meta.write_size = extracted_meta.write_size;
-                this->embed_data->meta.lsb_mode = extracted_meta.lsb_mode;
-                // meta_size — const, ignore (always sizeof(MetaData)).
-            } else {
-                meta_from_pixels = false;
-                std::cerr << CLI_YELLOW << "Pixel metadata invalid (not PHOTO), trying JPEG DCT..." << CLI_RESET << std::endl;
-                image_guard.reset();  // Free pixels early.
-            }
-        } else if (!is_loadable) {
-            meta_from_pixels = false;  // For JPEG: fallback.
-        }
-
-        // Step 3: Fallback to DCT for JPEG (if not meta_from_pixels).
-        if (!meta_from_pixels) {
-            dct_fallback_used = true;
-            JpegDecompressRAII decompress;
-            FILE* infile = std::fopen(path.c_str(), "rb");
-            if (!infile) {
-                std::cerr << CLI_RED << "Error: Failed to open for JPEG fallback: " << path << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-            auto close_infile = [](FILE* f) { std::fclose(f); };
-            std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
-
-            jpeg_stdio_src(&decompress.cinfo, infile);
-            if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
-                std::cerr << CLI_RED << "Error: JPEG header suspended in fallback." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-
-            jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
-            if (!coef_arrays) {
-                std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients for fallback." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-
-            // Extract meta from DCT (1-bit LSB).
-            auto meta_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, sizeof(MetaData));
-            if (!meta_dct_opt || meta_dct_opt->size() != sizeof(MetaData)) {
-                std::cerr << CLI_RED << "Error: Failed to extract JPEG metadata from DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-            std::copy(meta_dct_opt->begin(), meta_dct_opt->end(), reinterpret_cast<byte*>(&this->embed_data->meta));
-
-            // Validate DCT meta.
-            if (this->embed_data->meta.container != ContainerType::PHOTO ||
-                this->embed_data->meta.ext != Extension::JPEG ||
-                this->embed_data->meta.write_size < sizeof(MetaData)) {
-                std::cerr << CLI_RED << "Error: Invalid JPEG metadata from DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-
-            // Full extraction from DCT.
-            uint64_t full_bytes = this->embed_data->meta.write_size;
-            auto full_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, full_bytes);
-            if (!full_dct_opt || full_dct_opt->size() != full_bytes) {
-                std::cerr << CLI_RED << "Error: Incomplete full extraction from JPEG DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-
-            // Encrypt_data (skip meta).
-            uint64_t encrypt_bytes = full_bytes - sizeof(MetaData);
-            std::vector<byte> encrypt_data(full_dct_opt->begin() + sizeof(MetaData), full_dct_opt->end());
-            this->embed_data->encrypt_data = std::move(encrypt_data);
-
-            jpeg_finish_decompress(&decompress.cinfo);
-
-            // Decrypt (key already set).
-            AES256Encryption::getInstance().set_key(this->embed_data->key);
-            this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
-
-            std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from JPEG DCT." << CLI_RESET << std::endl;
-            return this->embed_data->plain_data;
-        }
-
-        // Step 4: Meta valid from pixels — branch by ext (switch for symmetry).
-        if (dct_fallback_used) {
-            return this->embed_data->plain_data;  // Fallback already processed.
-        }
-        std::optional<std::string> result;
-        switch (this->embed_data->meta.ext) {
-            case Extension::PNG:
-                result = png_out(image, this->embed_data->meta, path);
-                break;
-            case Extension::JPEG:
-                // Rare case: JPEG with valid pixel meta — fallback to DCT.
-                std::cerr << CLI_YELLOW << "Warning: JPEG detected via pixels; using DCT fallback." << CLI_RESET << std::endl;
-                image_guard.reset();
-                result = jpg_out(path);
-                break;
-            default:
-                std::cerr << CLI_YELLOW << "Warning: Unsupported extension in metadata." << CLI_RESET << std::endl;
-                return std::nullopt;
-        }
-
-        if (!result.has_value()) {
+        jpeg_stdio_src(&decompress.cinfo, infile);
+        if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
+            std::cerr << CLI_RED << "Error: JPEG header suspended in fallback." << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        // Step 5: Decrypt (for PNG, key already set).
+        jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
+        if (!coef_arrays) {
+            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients for fallback." << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+
+        // Extract meta from DCT (1-bit LSB).
+        auto meta_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, sizeof(MetaData));
+        if (!meta_dct_opt || meta_dct_opt->size() != sizeof(MetaData)) {
+            std::cerr << CLI_RED << "Error: Failed to extract JPEG metadata from DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+        std::copy(meta_dct_opt->begin(), meta_dct_opt->end(), reinterpret_cast<byte*>(&this->embed_data->meta));
+
+        // Validate DCT meta.
+        if (this->embed_data->meta.container != ContainerType::PHOTO ||
+            this->embed_data->meta.ext != Extension::JPEG ||
+            this->embed_data->meta.write_size < sizeof(MetaData)) {
+            std::cerr << CLI_RED << "Error: Invalid JPEG metadata from DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+
+        // Full extraction from DCT.
+        uint64_t full_bytes = this->embed_data->meta.write_size;
+        auto full_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, full_bytes);
+        if (!full_dct_opt || full_dct_opt->size() != full_bytes) {
+            std::cerr << CLI_RED << "Error: Incomplete full extraction from JPEG DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+
+        // Encrypt_data (skip meta).
+        uint64_t encrypt_bytes = full_bytes - sizeof(MetaData);
+        std::vector<byte> encrypt_data(full_dct_opt->begin() + sizeof(MetaData), full_dct_opt->end());
+        this->embed_data->encrypt_data = std::move(encrypt_data);
+
+        jpeg_finish_decompress(&decompress.cinfo);
+
+        // Decrypt (key already set).
         AES256Encryption::getInstance().set_key(this->embed_data->key);
         this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
 
-        std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from PNG pixels." << CLI_RESET << std::endl;
+        std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from JPEG DCT." << CLI_RESET << std::endl;
         return this->embed_data->plain_data;
     }
+
+    // Step 3: Meta valid from pixels — extract full data based on mode.
+    uint64_t encrypt_bytes = this->embed_data->meta.write_size - sizeof(MetaData);
+    uint64_t encrypt_bits = encrypt_bytes * 8;
+
+    // Skip bytes used for meta (1-bit LSB, so 8 bits per byte for meta -> sizeof(MetaData)*8 bytes skipped).
+    uint64_t meta_bits = sizeof(MetaData) * 8;
+    uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
+    if (img_bytes < meta_bits) {
+        std::cerr << CLI_RED << "Error: Insufficient image size for meta." << CLI_RESET << std::endl;
+        return std::nullopt;
+    }
+    byte* data_image = image + meta_bits;
+    uint64_t data_img_bytes = img_bytes - meta_bits;
+
+    std::vector<byte> encrypt_data;
+    switch (this->embed_data->meta.lsb_mode) {
+        case LsbMode::OneBit:
+            {
+                auto opt = lsb_one_bit_extract(data_image, data_img_bytes, encrypt_bytes);
+                if (!opt) {
+                    std::cerr << CLI_RED << "Error: Insufficient bits for 1-bit extraction." << CLI_RESET << std::endl;
+                    return std::nullopt;
+                }
+                encrypt_data = opt.value();
+            }
+            break;
+        case LsbMode::TwoBits:
+            {
+                auto opt = lsb_two_bit_extract(data_image, data_img_bytes, encrypt_bytes);
+                if (!opt) {
+                    std::cerr << CLI_RED << "Error: Insufficient bits for 2-bit extraction." << CLI_RESET << std::endl;
+                    return std::nullopt;
+                }
+                encrypt_data = opt.value();
+            }
+            break;
+        default:
+            std::cerr << CLI_RED << "Error: Unsupported LSB mode." << CLI_RESET << std::endl;
+            return std::nullopt;
+    }
+
+    this->embed_data->encrypt_data = std::move(encrypt_data);
+
+    // Step 4: Decrypt.
+    AES256Encryption::getInstance().set_key(this->embed_data->key);
+    this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
+
+    std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from pixels." << CLI_RESET << std::endl;
+    return this->embed_data->plain_data;
+}
 
 } // Yps

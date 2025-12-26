@@ -3,6 +3,7 @@
 
 using byte = unsigned char;
 
+
 #define CLI_RED "\033[31m"
 #define CLI_GREEN "\033[32m"
 #define CLI_YELLOW "\033[33m"

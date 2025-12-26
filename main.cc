@@ -1,11 +1,17 @@
-#include <iostream>
-#include <AuthorKey.hh>
-#include <cstdlib>
+// main.cc
+#include <QtWidgets/QApplication>
+#include "internal/GUI/GUI.hh"
 
-#include "EmbedData.hh"
-#include "Encryption.hh"
-#include "PhotoHnS/PhotoHnS.hh"
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    MainWindow window;
+    window.setWindowTitle("StegoApp - Hide and Seek");
+    window.resize(1200, 800);
+    window.show();
+    return app.exec();
+}
 
+/*
 int main(void)
 {
     // Print author info for verification (same as PNG test).
@@ -70,4 +76,4 @@ int main(void)
     std::cout << "Extracted: " << extracted_str << std::endl;
 
     return 0;  // Success.
-}
+}*/
