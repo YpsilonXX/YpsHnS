@@ -1,7 +1,3 @@
-//
-// Created by ypsilon on 10/7/25.
-//
-
 #ifndef YPSHNS_EMBEDDATA_HH
 #define YPSHNS_EMBEDDATA_HH
 
@@ -46,9 +42,9 @@ namespace Yps
         Extension ext;
 
         /**
-         * Name of plain(to embed) file
+         * Name of plain(to embed) file (fixed-size to ensure POD for safe memcpy)
          */
-        std::string filename;
+        char filename[64];
 
         /**
          * Size of all written path (meta + plain)

@@ -9,7 +9,7 @@
 #include <filesystem>  // For filename()
 #include <cstdio>      // For FILE*
 #include <stdexcept>   // For runtime_error
-#include <cstring>     // For std::memcpy
+#include <cstring>     // For std::memcpy, std::strncpy
 
 namespace Yps
 {
@@ -36,7 +36,14 @@ namespace Yps
         // Fill metadata (only filename, not full path — safer).
         this->embed_data->plain_data = data;
         this->embed_data->meta.container = ContainerType::PHOTO;
-        this->embed_data->meta.filename = std::filesystem::path(path).filename().string();
+        // Use strncpy to safely copy into fixed-size char array; truncate if too long.
+        std::string filename_str = std::filesystem::path(path).filename().string();
+        if (filename_str.size() >= 64) {
+            std::cerr << CLI_RED << "PhotoHnS::embed(): Filename too long (max 63 chars): " << filename_str << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+        std::strncpy(this->embed_data->meta.filename, filename_str.c_str(), 63);
+        this->embed_data->meta.filename[63] = '\0';  // Ensure null-termination.
         this->embed_data->key = AuthorKey::getInstance().get_key();
 
         // Encryption (key from AuthorKey).
@@ -73,7 +80,7 @@ namespace Yps
     {
         // Load image (RAII: free at end).
         int32_t width, height, channels;
-        byte* image = stbi_load(this->embed_data->meta.filename.c_str(), &width, &height, &channels, 0);
+        byte* image = stbi_load(this->embed_data->meta.filename, &width, &height, &channels, 0);
         if (!image) {
             std::cerr << CLI_RED << "Error: Failed to load PNG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
             return std::nullopt;
@@ -147,7 +154,7 @@ namespace Yps
 
         // RAII for decompress (manual finish — see below).
         JpegDecompressRAII decompress;
-        FILE* infile = std::fopen(this->embed_data->meta.filename.c_str(), "rb");
+        FILE* infile = std::fopen(this->embed_data->meta.filename, "rb");
         if (!infile) {
             std::cerr << CLI_RED << "Error: Failed to open JPEG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
             return std::nullopt;
@@ -424,7 +431,7 @@ namespace Yps
             jpeg_finish_decompress(&decompress.cinfo);
             return std::nullopt;
         }
-        std::copy(meta_opt->begin(), meta_opt->end(), reinterpret_cast<byte*>(&this->embed_data->meta));
+        std::memcpy(&this->embed_data->meta, meta_opt->data(), sizeof(MetaData));
 
         // Validate extracted metadata.
         if (this->embed_data->meta.container != ContainerType::PHOTO ||
@@ -581,7 +588,7 @@ namespace Yps
             }
 
             // Copy to extracted_meta.
-            std::copy(meta_bytes.begin(), meta_bytes.end(), reinterpret_cast<byte*>(&extracted_meta));
+            std::memcpy(&extracted_meta, meta_bytes.data(), sizeof(MetaData));
 
             // Validation: If PHOTO — use pixels.
             if (extracted_meta.container == ContainerType::PHOTO) {
@@ -589,7 +596,8 @@ namespace Yps
                 // Manual copy (operator= deleted due to const meta_size).
                 this->embed_data->meta.container = extracted_meta.container;
                 this->embed_data->meta.ext = extracted_meta.ext;
-                this->embed_data->meta.filename = extracted_meta.filename;
+                std::strncpy(this->embed_data->meta.filename, extracted_meta.filename, 63);
+                this->embed_data->meta.filename[63] = '\0';  // Ensure null-termination after copy.
                 this->embed_data->meta.write_size = extracted_meta.write_size;
                 this->embed_data->meta.lsb_mode = extracted_meta.lsb_mode;
                 // meta_size — const, ignore (always sizeof(MetaData)).
@@ -633,7 +641,7 @@ namespace Yps
                 jpeg_finish_decompress(&decompress.cinfo);
                 return std::nullopt;
             }
-            std::copy(meta_dct_opt->begin(), meta_dct_opt->end(), reinterpret_cast<byte*>(&this->embed_data->meta));
+            std::memcpy(&this->embed_data->meta, meta_dct_opt->data(), sizeof(MetaData));
 
             // Validate DCT meta.
             if (this->embed_data->meta.container != ContainerType::PHOTO ||
