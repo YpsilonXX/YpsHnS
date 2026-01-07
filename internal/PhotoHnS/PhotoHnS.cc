@@ -1,3 +1,4 @@
+// PhotoHnS.cc
 #include "PhotoHnS.hh"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -27,31 +28,30 @@ namespace Yps
 
     std::optional<std::string> PhotoHnS::embed(const std::vector<byte>& data, const std::string& path, const std::string& out_path)
     {
-        // Initialize EmbedData (reset if needed).
-        if (!this->embed_data)
-            this->embed_data = std::make_unique<EmbedData>();
-        else
-            this->embed_data = std::make_unique<EmbedData>();  // Automatic reset via move.
+        // Local variables instead of EmbedData struct for simplicity and direct control.
+        MetaData meta{};
+        std::array<byte, SHA256_DIGEST_LENGTH> key = AuthorKey::getInstance().get_key();
+        std::vector<byte> encrypted_data;
 
         // Fill metadata (only filename, not full path — safer).
-        this->embed_data->plain_data = data;
-        this->embed_data->meta.container = ContainerType::PHOTO;
+        meta.container = ContainerType::PHOTO;
         // Use strncpy to safely copy into fixed-size char array; truncate if too long.
         std::string filename_str = std::filesystem::path(path).filename().string();
-        if (filename_str.size() >= 64) {
-            std::cerr << CLI_RED << "PhotoHnS::embed(): Filename too long (max 63 chars): " << filename_str << CLI_RESET << std::endl;
+        if (filename_str.size() >= 256) {
+            std::cerr << CLI_RED << "PhotoHnS::embed(): Filename too long (max 255 chars): " << filename_str << CLI_RESET << std::endl;
             return std::nullopt;
         }
-        std::strncpy(this->embed_data->meta.filename, filename_str.c_str(), 63);
-        this->embed_data->meta.filename[63] = '\0';  // Ensure null-termination.
-        this->embed_data->key = AuthorKey::getInstance().get_key();
+        std::strncpy(meta.filename, filename_str.c_str(), 255);
+        meta.filename[255] = '\0';  // Ensure null-termination.
+        meta.lsb_mode = LsbMode::NoUsed;  // Will be set in specific embed methods.
+        meta.meta_size = sizeof(MetaData);  // Set the size manually to avoid const issues.
 
         // Encryption (key from AuthorKey).
-        AES256Encryption::getInstance().set_key(this->embed_data->key);
-        this->embed_data->encrypt_data = AES256Encryption::getInstance().encrypt(this->embed_data->plain_data);
+        AES256Encryption::getInstance().set_key(key);
+        encrypted_data = AES256Encryption::getInstance().encrypt(data);
 
-        // write_size: encrypt + sizeof(MetaData) (temporary; for raw copy).
-        this->embed_data->meta.write_size = this->embed_data->encrypt_data.size() + sizeof(MetaData);
+        // write_size: encrypted + sizeof(MetaData).
+        meta.write_size = encrypted_data.size() + sizeof(MetaData);
 
         // Path validation.
         auto ext_opt = validate_path(path);
@@ -61,346 +61,85 @@ namespace Yps
         }
         std::string filetype = ext_opt.value();
 
-        // Support PNG and JPEG.
+        // Support PNG and JPEG; delegate to specific embed methods.
         if (filetype == "png") {
-            this->embed_data->meta.ext = Extension::PNG;
-            this->embed_data->meta.lsb_mode = LsbMode::NoUsed;  // Will be set in png_in.
-            return this->png_in(out_path);
+            meta.ext = Extension::PNG;
+            return png_embed(path, out_path, encrypted_data, meta);
         } else if (filetype == "jpg" || filetype == "jpeg") {
-            this->embed_data->meta.ext = Extension::JPEG;
-            this->embed_data->meta.lsb_mode = LsbMode::OneBit;  // Only 1-bit mode for DCT.
-            return this->jpg_in(out_path);
+            meta.ext = Extension::JPEG;
+            meta.lsb_mode = LsbMode::OneBit;  // Only 1-bit mode for DCT.
+            return jpg_embed(path, out_path, encrypted_data, meta);
         }
 
         std::cerr << CLI_RED << "PhotoHnS::embed(): Unsupported extension: " << filetype << CLI_RESET << std::endl;
         return std::nullopt;
     }
 
-    std::optional<std::string> PhotoHnS::png_in(const std::string &out_path)
+    std::optional<std::string> PhotoHnS::png_embed(const std::string& path, const std::string& out_path,
+                                                   const std::vector<byte>& encrypted_data, MetaData& meta)
     {
         // Load image (RAII: free at end).
         int32_t width, height, channels;
-        byte* image = stbi_load(this->embed_data->meta.filename, &width, &height, &channels, 0);
+        byte* image = stbi_load(path.c_str(), &width, &height, &channels, 0);
         if (!image) {
-            std::cerr << CLI_RED << "Error: Failed to load PNG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
+            std::cerr << CLI_RED << "Error: Failed to load PNG: " << path << CLI_RESET << std::endl;
             return std::nullopt;
         }
-
         auto free_image = [](byte* p) noexcept { stbi_image_free(p); };
         std::unique_ptr<byte, decltype(free_image)> image_guard(image, free_image);
 
+        // Optional: Check alpha for usability (full opacity reduces artifacts).
+        if (channels == 4 && !has_usable_alpha(image, width, height, channels)) {
+            std::cout << CLI_YELLOW << "Warning: PNG has variable alpha — artifacts may appear in transparent areas." << CLI_RESET << std::endl;
+        }
+
         // Capacity calculation (image bytes = bits for 1-bit LSB).
         uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
-        uint64_t data_bytes = this->embed_data->encrypt_data.size() + sizeof(MetaData);
+        uint64_t data_bytes = encrypted_data.size() + sizeof(MetaData);
         uint64_t total_bits = data_bytes * 8ULL;
 
         // Mode selection (strict <= for safety).
-        LsbMode mode = LsbMode::NoUsed;
         if (total_bits <= img_bytes) {
-            mode = LsbMode::OneBit;
-        } else if (total_bits <= img_bytes * 2ULL) {  // Simplified; optionally subtract meta*8.
+            meta.lsb_mode = LsbMode::OneBit;
+        } else if (total_bits <= img_bytes * 2ULL) {
             std::cout << CLI_YELLOW << "Warning: Using LsbMode::TwoBits — artifacts may be visible." << CLI_RESET << std::endl;
-            mode = LsbMode::TwoBits;
+            meta.lsb_mode = LsbMode::TwoBits;
         } else {
             std::cerr << CLI_RED << "Error: Insufficient capacity in PNG (needed " << total_bits
                       << " bits, available ~" << img_bytes * 2 << ")." << CLI_RESET << std::endl;
             return std::nullopt;
         }
-        this->embed_data->meta.lsb_mode = mode;
 
-        // Prepare full_data: metadata followed by encrypted data.
-        std::vector<byte> full_data(data_bytes);
-        MetaData* m = &this->embed_data->meta;
-        std::copy(reinterpret_cast<const byte*>(m), reinterpret_cast<const byte*>(m) + sizeof(MetaData), full_data.begin());
-        std::copy(this->embed_data->encrypt_data.begin(), this->embed_data->encrypt_data.end(),
-                  full_data.begin() + sizeof(MetaData));
+        // Prepare full data to embed: meta + encrypted.
+        std::vector<byte> full_data(sizeof(MetaData) + encrypted_data.size());
+        std::memcpy(full_data.data(), &meta, sizeof(MetaData));
+        std::memcpy(full_data.data() + sizeof(MetaData), encrypted_data.data(), encrypted_data.size());
 
-        // Embedding with bounds checks.
-        switch (mode) {
-            case LsbMode::OneBit:
-                this->lsb_one_bit(image, full_data, img_bytes);
-                break;
-            case LsbMode::TwoBits:
-                this->lsb_two_bit(image, full_data, img_bytes);
-                break;
-            default:
-                return std::nullopt;
+        // Embed using selected mode.
+        if (meta.lsb_mode == LsbMode::OneBit) {
+            lsb_one_bit(image, full_data, img_bytes);
+        } else if (meta.lsb_mode == LsbMode::TwoBits) {
+            lsb_two_bit(image, full_data, img_bytes);
         }
 
-        // Save (stride=0 auto).
-        int success = stbi_write_png(out_path.c_str(), width, height, channels, image, 0);
-        if (!success) {
+        // Write output PNG.
+        if (!stbi_write_png(out_path.c_str(), width, height, channels, image, width * channels)) {
             std::cerr << CLI_RED << "Error: Failed to write PNG: " << out_path << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        std::cout << CLI_GREEN << "Embedded " << data_bytes << " bytes into " << out_path << " (mode: "
-                  << static_cast<int>(mode) << ")." << CLI_RESET << std::endl;
         return out_path;
     }
 
-    std::optional<std::string> PhotoHnS::jpg_in(const std::string &out_path)
+    std::optional<std::string> PhotoHnS::jpg_embed(const std::string& path, const std::string& out_path,
+                                                   const std::vector<byte>& encrypted_data, const MetaData& meta)
     {
-        // Prepare full_data: metadata + encrypted data.
-        uint64_t data_bytes = this->embed_data->meta.write_size;
-        std::vector<byte> full_data(data_bytes);
-        MetaData* m = &this->embed_data->meta;
-        std::copy(reinterpret_cast<const byte*>(m), reinterpret_cast<const byte*>(m) + sizeof(MetaData), full_data.begin());
-        std::copy(this->embed_data->encrypt_data.begin(), this->embed_data->encrypt_data.end(),
-                  full_data.begin() + sizeof(MetaData));
+        // Prepare full data to embed: meta + encrypted.
+        std::vector<byte> full_data(sizeof(MetaData) + encrypted_data.size());
+        std::memcpy(full_data.data(), &meta, sizeof(MetaData));
+        std::memcpy(full_data.data() + sizeof(MetaData), encrypted_data.data(), encrypted_data.size());
 
-        uint64_t total_bits = data_bytes * 8ULL;
-        if (total_bits == 0) return std::nullopt;  // Edge case.
-
-        // RAII for decompress (manual finish — see below).
-        JpegDecompressRAII decompress;
-        FILE* infile = std::fopen(this->embed_data->meta.filename, "rb");
-        if (!infile) {
-            std::cerr << CLI_RED << "Error: Failed to open JPEG: " << this->embed_data->meta.filename << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-        auto close_infile = [](FILE* f) { std::fclose(f); };
-        std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
-
-        // Set up input source and read header.
-        jpeg_stdio_src(&decompress.cinfo, infile);
-        if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
-            std::cerr << CLI_RED << "Error: JPEG header read suspended." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-
-        // Log progressive and force baseline (enforced on compress side).
-        if (decompress.cinfo.progressive_mode) {
-            std::cout << CLI_YELLOW << "Input is progressive JPEG; forcing baseline output." << CLI_RESET << std::endl;
-        }
-
-        // Read DCT coefficients (keep decompress alive until transcoding end).
-        jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
-        if (!coef_arrays) {
-            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);  // Safe cleanup.
-            return std::nullopt;
-        }
-
-        // Calculate capacity (AC: 63 bits per block, skip DC).
-        uint64_t ac_capacity_bits = 0;
-        for (int ci = 0; ci < decompress.cinfo.num_components; ++ci) {
-            jpeg_component_info* comp = decompress.cinfo.comp_info + ci;
-            ac_capacity_bits += static_cast<uint64_t>(comp->height_in_blocks) * comp->width_in_blocks * 63ULL;
-        }
-        if (total_bits > ac_capacity_bits) {
-            std::cerr << CLI_RED << "Error: Insufficient capacity in JPEG (needed " << total_bits
-                      << " bits, available " << ac_capacity_bits << ")." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);
-            return std::nullopt;
-        }
-        std::cout << CLI_YELLOW << "JPEG capacity check: " << ac_capacity_bits << " AC bits available." << CLI_RESET << std::endl;
-
-        // Embed LSB in AC (modifies coef_arrays via access_virt_barray).
-        this->dct_lsb_embed(coef_arrays, decompress.cinfo, full_data);
-
-        // RAII for compress (manual finish below).
-        JpegCompressRAII compress;
-        FILE* outfile = std::fopen(out_path.c_str(), "wb");
-        if (!outfile) {
-            std::cerr << CLI_RED << "Error: Failed to open output: " << out_path << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);  // Cleanup on fail.
-            return std::nullopt;
-        }
-        auto close_outfile = [](FILE* f) { std::fclose(f); };
-        std::unique_ptr<FILE, decltype(close_outfile)> outfile_guard(outfile, close_outfile);
-
-        jpeg_stdio_dest(&compress.cinfo, outfile);
-
-        // Copy critical parameters — do this while decompress is still valid.
-        jpeg_copy_critical_parameters(&decompress.cinfo, &compress.cinfo);
-
-        // Force baseline to avoid Huffman corruption (no progressive/arith).
-        compress.cinfo.progressive_mode = FALSE;
-        compress.cinfo.arith_code = FALSE;
-        compress.cinfo.optimize_coding = FALSE;  // Stable Huffman tables.
-
-        // Pass modified coef_arrays to write_coefficients (no field assign).
-        jpeg_write_coefficients(&compress.cinfo, coef_arrays);  // Full call: cinfo + arrays.
-
-        // Finish compress (writes trailer, but does not free arrays — shared).
-        jpeg_finish_compress(&compress.cinfo);  // Errors via err_mgr.
-
-        // Now safe to finish decompress (free arrays after compress).
-        jpeg_finish_decompress(&decompress.cinfo);
-
-        std::cout << CLI_GREEN << "Embedded " << data_bytes << " bytes into JPEG DCT (" << out_path << ")." << CLI_RESET << std::endl;
-        return out_path;
-    }
-
-    void PhotoHnS::lsb_one_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes)
-    {
-        // 1 bit per image byte, MSB-first.
-        uint64_t total_bits = data.size() * 8ULL;
-        if (total_bits > img_bytes) {
-            throw std::runtime_error("Internal: Capacity mismatch in lsb_one_bit");  // Should not happen.
-        }
-
-        uint64_t bit_idx = 0;
-        for (uint64_t i = 0; i < total_bits; ++i) {
-            if (i >= img_bytes) break;  // Extra safety.
-
-            byte current_byte = data[bit_idx / 8];
-            int bit_pos_in_byte = bit_idx % 8;
-            byte bit = (current_byte >> (7 - bit_pos_in_byte)) & 1;
-            image[i] = (image[i] & 0xFE) | bit;
-            ++bit_idx;
-        }
-    }
-
-    void PhotoHnS::lsb_two_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes)
-    {
-        uint64_t total_bits = data.size() * 8ULL;
-        uint64_t meta_bits = sizeof(MetaData) * 8ULL;  // Bits for metadata (raw sizeof).
-        uint64_t bit_idx = 0;
-        uint64_t img_idx = 0;
-
-        // First part: metadata in 1-bit mode (safe, no overflow).
-        for (; bit_idx < meta_bits && img_idx < img_bytes; ++img_idx) {
-            byte current_byte = data[bit_idx / 8];
-            int bit_pos_in_byte = bit_idx % 8;
-            byte bit = (current_byte >> (7 - bit_pos_in_byte)) & 1;
-            image[img_idx] = (image[img_idx] & 0xFE) | bit;
-            ++bit_idx;
-        }
-
-        // Second part: remainder in 2-bit mode (pairs of bits, MSB-first).
-        for (; bit_idx < total_bits && img_idx < img_bytes; ++img_idx) {
-            if (bit_idx + 1 >= total_bits) break;  // Odd bits — stop.
-
-            byte current_byte = data[bit_idx / 8];
-            int bit_pos_in_byte = bit_idx % 8;
-            byte bits = (current_byte >> (6 - bit_pos_in_byte)) & 0x03;  // 2 bits.
-            image[img_idx] = (image[img_idx] & 0xFC) | bits;
-            bit_idx += 2;
-        }
-
-        if (bit_idx < total_bits) {
-            std::cerr << CLI_YELLOW << "Warning: Incomplete embed in TwoBits (used " << bit_idx << "/" << total_bits << " bits)." << CLI_RESET << std::endl;
-        }
-    }
-
-    void PhotoHnS::dct_lsb_embed(jvirt_barray_ptr* coef_arrays, const jpeg_decompress_struct& cinfo,
-                                 const std::vector<byte>& data)
-    {
-        uint64_t bit_idx = 0;
-        uint64_t total_bits = data.size() * 8ULL;
-
-        // Iteration: components → block rows → blocks → AC coeffs (skip DC=0).
-        for (int ci = 0; ci < cinfo.num_components && bit_idx < total_bits; ++ci) {
-            jpeg_component_info* comp = cinfo.comp_info + ci;
-
-            for (JDIMENSION blk_row = 0; blk_row < comp->height_in_blocks && bit_idx < total_bits; ++blk_row) {
-                // Access row (write mode: TRUE — modify in-place).
-                JBLOCKARRAY block_array = (JBLOCKARRAY) (*cinfo.mem->access_virt_barray)
-                    ((j_common_ptr) &cinfo, coef_arrays[ci], blk_row, 1, TRUE);  // TRUE for write.
-                if (block_array == nullptr) {
-                    std::cerr << CLI_RED << "Error: Failed to access DCT block row " << blk_row << " for embedding." << CLI_RESET << std::endl;
-                    return;  // Abort gracefully.
-                }
-                JBLOCKROW block_row = block_array[0];
-
-                for (JDIMENSION blk_col = 0; blk_col < comp->width_in_blocks && bit_idx < total_bits; ++blk_col) {
-                    JBLOCK* block = block_row + blk_col;
-
-                    for (int k = 1; k < DCTSIZE2 && bit_idx < total_bits; ++k) {  // Skip DC (k=0).
-                        // LSB embed: clear bit, set to data_bit (MSB-first).
-                        uint64_t byte_idx = bit_idx / 8ULL;
-                        int bit_offset = bit_idx % 8;
-                        byte data_bit = (data[byte_idx] >> (7 - bit_offset)) & 1;
-
-                        JCOEF& coef = (*block)[k];
-                        coef = (coef & ~1) | static_cast<JCOEF>(data_bit);  // Set LSB.
-
-                        // Clamp for DCT-range (avoid overflow in Huffman).
-                        if (coef > 1023) coef = 1023;
-                        else if (coef < -1024) coef = -1024;
-
-                        ++bit_idx;
-                    }
-                }
-            }
-        }
-
-        if (bit_idx < total_bits) {
-            std::cerr << CLI_YELLOW << "Warning: Partial embed (" << bit_idx << "/" << total_bits << " bits)." << CLI_RESET << std::endl;
-        }
-    }
-
-    std::optional<std::string> PhotoHnS::png_out(byte* image, MetaData& meta, const std::string& path)
-    {
-        // Prepare full_data with metadata prefix.
-        uint64_t data_bytes = meta.write_size;
-        std::vector<byte> full_data(data_bytes, 0);
-        std::copy(reinterpret_cast<const byte*>(&meta), reinterpret_cast<const byte*>(&meta) + sizeof(MetaData),
-                  full_data.begin());
-
-        uint64_t total_bits = data_bytes * 8ULL;
-        uint64_t meta_bits = sizeof(MetaData) * 8ULL;
-        bool success = true;
-
-        // Start extraction after metadata bits (image indices align with bit positions for 1-bit, adjusted for 2-bit).
-        // Note: Use total_bits as upper bound (assumes sufficient capacity from embed; real img_bytes larger).
-        uint64_t img_idx = meta_bits;
-        uint64_t bit_pos = meta_bits;
-
-        if (meta.lsb_mode == LsbMode::OneBit) {
-            // 1 bit per image byte, MSB-first.
-            for (; bit_pos < total_bits && img_idx < total_bits; ++img_idx, ++bit_pos) {
-                if (img_idx >= total_bits) { success = false; break; }  // Safety.
-
-                byte bit = image[img_idx] & 0x01;
-                uint64_t byte_idx = bit_pos / 8ULL;
-                if (byte_idx >= full_data.size()) { success = false; break; }
-
-                int bit_offset = bit_pos % 8;
-                full_data[byte_idx] |= (bit << (7 - bit_offset));
-            }
-        } else if (meta.lsb_mode == LsbMode::TwoBits) {
-            // 2 bits per image byte (after metadata in 1-bit); img_idx advances per pair.
-            for (; bit_pos + 1 < total_bits && img_idx < total_bits; ++img_idx, bit_pos += 2) {
-                if (img_idx >= total_bits) { success = false; break; }
-
-                byte bits = image[img_idx] & 0x03;
-                uint64_t byte_idx = bit_pos / 8ULL;
-                if (byte_idx >= full_data.size()) { success = false; break; }
-
-                int bit_offset = bit_pos % 8;
-                int shift = 6 - bit_offset;  // Matches embed: shifts for 6,4,2,0 aligning to MSB.
-                full_data[byte_idx] |= (static_cast<byte>(bits) << shift);
-            }
-        } else {
-            std::cerr << CLI_RED << "Error: Unsupported LsbMode: " << static_cast<int>(meta.lsb_mode) << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-
-        if (!success || bit_pos < total_bits) {
-            std::cerr << CLI_RED << "Error: Incomplete extraction (mode: " << static_cast<int>(meta.lsb_mode)
-                      << ", extracted " << bit_pos << "/" << total_bits << " bits)." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-
-        // Extract encrypted data (metadata already in full_data).
-        std::vector<byte> encrypt_data(full_data.begin() + sizeof(MetaData), full_data.end());
-        this->embed_data->encrypt_data = std::move(encrypt_data);
-
-        // Decrypt.
-        AES256Encryption::getInstance().set_key(this->embed_data->key);
-        this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
-
-        std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes (mode: "
-                  << static_cast<int>(meta.lsb_mode) << ")." << CLI_RESET << std::endl;
-        return path;
-    }
-
-    std::optional<std::string> PhotoHnS::jpg_out(const std::string& path)
-    {
-        // RAII decompress.
+        // JPEG compression setup (RAII).
         JpegDecompressRAII decompress;
         FILE* infile = std::fopen(path.c_str(), "rb");
         if (!infile) {
@@ -410,302 +149,318 @@ namespace Yps
         auto close_infile = [](FILE* f) { std::fclose(f); };
         std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
 
-        // Set up standard input source and read header.
         jpeg_stdio_src(&decompress.cinfo, infile);
         if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
-            std::cerr << CLI_RED << "Error: JPEG header read suspended in extract." << CLI_RESET << std::endl;
+            std::cerr << CLI_RED << "Error: JPEG header suspended." << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        // Read coefficients (DCT blocks).
         jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
         if (!coef_arrays) {
-            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients in extract." << CLI_RESET << std::endl;
+            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients." << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        // Extract metadata first (small, from first AC coefficients).
-        auto meta_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, sizeof(MetaData));
-        if (!meta_opt || meta_opt->size() != sizeof(MetaData)) {
-            std::cerr << CLI_RED << "Error: Failed to extract JPEG metadata." << CLI_RESET << std::endl;
+        // Embed into DCT coefficients.
+        dct_lsb_embed(coef_arrays, decompress.cinfo, full_data);
+
+        // Write modified JPEG.
+        JpegCompressRAII compress;
+        FILE* outfile = std::fopen(out_path.c_str(), "wb");
+        if (!outfile) {
+            std::cerr << CLI_RED << "Error: Failed to open output JPEG: " << out_path << CLI_RESET << std::endl;
             jpeg_finish_decompress(&decompress.cinfo);
             return std::nullopt;
         }
-        std::memcpy(&this->embed_data->meta, meta_opt->data(), sizeof(MetaData));
+        auto close_outfile = [](FILE* f) { std::fclose(f); };
+        std::unique_ptr<FILE, decltype(close_outfile)> outfile_guard(outfile, close_outfile);
 
-        // Validate extracted metadata.
-        if (this->embed_data->meta.container != ContainerType::PHOTO ||
-            this->embed_data->meta.ext != Extension::JPEG ||
-            this->embed_data->meta.write_size < sizeof(MetaData)) {
-            std::cerr << CLI_RED << "Error: Invalid extracted metadata for JPEG." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);
-            return std::nullopt;
-        }
+        jpeg_stdio_dest(&compress.cinfo, outfile);
+        jpeg_copy_critical_parameters(&decompress.cinfo, &compress.cinfo);
+        jpeg_write_coefficients(&compress.cinfo, coef_arrays);
 
-        // Now extract full data using write_size from metadata.
-        uint64_t full_bytes = this->embed_data->meta.write_size;
-        auto full_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, full_bytes);
-        if (!full_opt || full_opt->size() != full_bytes) {
-            std::cerr << CLI_RED << "Error: Failed to extract full JPEG data." << CLI_RESET << std::endl;
-            jpeg_finish_decompress(&decompress.cinfo);
-            return std::nullopt;
-        }
-
-        // Extract encrypted data (skip metadata prefix).
-        uint64_t encrypt_bytes = full_bytes - sizeof(MetaData);
-        std::vector<byte> encrypt_data(full_opt->begin() + sizeof(MetaData), full_opt->end());
-        this->embed_data->encrypt_data = std::move(encrypt_data);
-
-        // Decrypt.
-        AES256Encryption::getInstance().set_key(this->embed_data->key);
-        this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
-
+        jpeg_finish_compress(&compress.cinfo);
         jpeg_finish_decompress(&decompress.cinfo);
 
-        std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from JPEG DCT." << CLI_RESET << std::endl;
-        return path;
-    }
-
-    std::optional<std::vector<byte>> PhotoHnS::dct_lsb_extract(jvirt_barray_ptr* coef_arrays,
-                                                               const jpeg_decompress_struct& cinfo,
-                                                               uint64_t num_bytes) const
-    {
-        if (num_bytes == 0) return std::vector<byte>{};
-        uint64_t total_bits = num_bytes * 8ULL;
-        std::vector<byte> data(num_bytes, 0);
-        uint64_t bit_idx = 0;
-
-        // Iteration same as embed: over components, block rows, blocks, AC coefficients.
-        // Access virtual arrays row-by-row for reading (read mode: FALSE).
-        for (int ci = 0; ci < cinfo.num_components && bit_idx < total_bits; ++ci) {
-            jpeg_component_info* comp = cinfo.comp_info + ci;
-
-            for (JDIMENSION blk_row = 0; blk_row < comp->height_in_blocks && bit_idx < total_bits; ++blk_row) {
-                // Access one row of blocks (read-only); safety check for NULL.
-                JBLOCKARRAY block_array = (JBLOCKARRAY) (*cinfo.mem->access_virt_barray)
-                    ((j_common_ptr) &cinfo, coef_arrays[ci], blk_row, 1, FALSE);
-                if (block_array == nullptr) {
-                    std::cerr << CLI_RED << "Error: Failed to access DCT block row " << blk_row << " for extraction (component " << ci << ")." << CLI_RESET << std::endl;
-                    return std::nullopt;  // Abort extraction safely.
-                }
-                JBLOCKROW block_row = block_array[0];  // Single row.
-
-                for (JDIMENSION blk_col = 0; blk_col < comp->width_in_blocks && bit_idx < total_bits; ++blk_col) {
-                    JBLOCK* block = block_row + blk_col;  // Pointer to JBLOCK (JCOEF[64]).
-
-                    for (int k = 1; k < DCTSIZE2 && bit_idx < total_bits; ++k) {
-                        // LSB from coefficient.
-                        const JCOEF& coef = (*block)[k];
-                        byte bit = static_cast<byte>(coef & 1);
-
-                        uint64_t byte_idx = bit_idx / 8ULL;
-                        if (byte_idx >= num_bytes) break;
-
-                        int bit_offset = bit_idx % 8;
-                        data[byte_idx] |= (bit << (7 - bit_offset));
-                        ++bit_idx;
-                    }
-                }
-            }
-        }
-
-        if (bit_idx < total_bits) {
-            std::cerr << CLI_RED << "Error: Incomplete DCT extraction (" << bit_idx << "/" << total_bits << " bits)." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
-
-        return data;
+        return out_path;
     }
 
     std::optional<std::vector<byte>> PhotoHnS::extract(const std::string& path)
     {
-        // Step 0: Initialize context (fail if none).
-        if (!this->embed_data) {
-            std::cerr << CLI_RED << "Error: No EmbedData context in extract." << CLI_RESET << std::endl;
-            return std::nullopt;
-        }
+        // Local variables for extraction.
+        MetaData meta{};
+        std::array<byte, SHA256_DIGEST_LENGTH> key = AuthorKey::getInstance().get_key();
+        std::vector<byte> encrypted_data;
+        std::vector<byte> plain_data;
 
-        // Step 0.1: Set key (singleton, once — avoid duplicates).
-        this->embed_data->key = AuthorKey::getInstance().get_key();
-
-        // Step 0.2: Validate path and type (adaptive by ext).
+        // Path validation.
         auto ext_opt = validate_path(path);
         if (!ext_opt) {
-            std::cerr << CLI_RED << "Error: Invalid path for extraction: " << path << CLI_RESET << std::endl;
+            std::cerr << CLI_RED << "PhotoHnS::extract(): Invalid path: " << path << CLI_RESET << std::endl;
             return std::nullopt;
         }
         std::string filetype = ext_opt.value();
-        bool is_jpeg = (filetype == "jpg" || filetype == "jpeg");
-        bool skip_pixel_mode = is_jpeg;  // For JPEG: direct DCT, no stbi_load().
 
-        // Step 1: Attempt pixel loading (only for PNG).
-        struct StbiDeleter {
-            void operator()(byte* p) const noexcept { stbi_image_free(p); }
-        };
-        std::unique_ptr<byte, StbiDeleter> image_guard;  // RAII: auto-free.
-        int32_t width = 0, height = 0, channels = 0;
-        byte* image = nullptr;
-        uint64_t img_bytes = 0;
-        bool is_loadable = false;
-
-        if (!skip_pixel_mode) {  // PNG: Load pixels.
-            image = stbi_load(path.c_str(), &width, &height, &channels, 0);
-            is_loadable = (image != nullptr);
-            if (is_loadable) {
-                image_guard.reset(image);
-                img_bytes = static_cast<uint64_t>(width) * height * channels;
-            }
-        } else {
-            is_loadable = false;  // For JPEG: Simulate fail, proceed to fallback.
+        // Try pixel-based extraction first (for PNG or JPEG with pixel meta).
+        // Load image for pixel access.
+        int32_t width, height, channels;
+        byte* image = stbi_load(path.c_str(), &width, &height, &channels, 0);
+        if (!image) {
+            std::cerr << CLI_RED << "Error: Failed to load image: " << path << CLI_RESET << std::endl;
+            return std::nullopt;
         }
+        auto free_image = [](byte* p) noexcept { stbi_image_free(p); };
+        std::unique_ptr<byte, decltype(free_image)> image_guard(image, free_image);
 
-        if (!is_loadable) {
-            // Silent for JPEG (no cerr); error only for PNG (real fail).
-            if (!skip_pixel_mode) {
-                std::cerr << CLI_RED << "Error: Failed to load image: " << path << " (stbi)." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-            // For JPEG: Quietly skip (fallback will handle).
-        }
+        uint64_t img_bytes = static_cast<uint64_t>(width) * height * channels;
 
-        // Step 2: Extract metadata (from pixels if loaded).
-        MetaData extracted_meta{};  // Local for validation.
-        bool meta_from_pixels = false;
-        bool dct_fallback_used = false;  // Flag: fallback processed?
-        if (is_loadable && img_bytes >= sizeof(MetaData) * 8ULL) {
-            // LSB 1-bit from first bytes (MSB-first).
-            size_t meta_byte_size = sizeof(MetaData);
-            std::vector<byte> meta_bytes(meta_byte_size, 0);
-            size_t bit_pos = 0;
-            for (size_t i = 0; i < meta_byte_size * 8ULL; ++i) {
-                if (i >= img_bytes) break;  // Bounds-check.
-
-                byte bit = image[i] & 0x01;
-                size_t byte_idx = bit_pos / 8;
-                size_t bit_offset = bit_pos % 8;
-                meta_bytes[byte_idx] |= (bit << (7 - bit_offset));
-                ++bit_pos;
-            }
-
-            // Copy to extracted_meta.
-            std::memcpy(&extracted_meta, meta_bytes.data(), sizeof(MetaData));
-
-            // Validation: If PHOTO — use pixels.
-            if (extracted_meta.container == ContainerType::PHOTO) {
-                meta_from_pixels = true;
-                // Manual copy (operator= deleted due to const meta_size).
-                this->embed_data->meta.container = extracted_meta.container;
-                this->embed_data->meta.ext = extracted_meta.ext;
-                std::strncpy(this->embed_data->meta.filename, extracted_meta.filename, 63);
-                this->embed_data->meta.filename[63] = '\0';  // Ensure null-termination after copy.
-                this->embed_data->meta.write_size = extracted_meta.write_size;
-                this->embed_data->meta.lsb_mode = extracted_meta.lsb_mode;
-                // meta_size — const, ignore (always sizeof(MetaData)).
+        // Attempt to extract meta from pixels.
+        auto meta_opt = extract_meta_from_pixels(image, img_bytes);
+        if (meta_opt) {
+            meta = *meta_opt;
+            // Validate meta.
+            if (meta.container != ContainerType::PHOTO || meta.write_size < sizeof(MetaData) || meta.meta_size != sizeof(MetaData)) {
+                std::cerr << CLI_RED << "Error: Invalid metadata from pixels." << CLI_RESET << std::endl;
             } else {
-                meta_from_pixels = false;
-                std::cerr << CLI_YELLOW << "Pixel metadata invalid (not PHOTO), trying JPEG DCT..." << CLI_RESET << std::endl;
-                image_guard.reset();  // Free pixels early.
+                // Extract full data from pixels using detected mode.
+                auto full_data_opt = extract_data_from_pixels(image, img_bytes, meta.write_size, meta.lsb_mode);
+                if (full_data_opt && full_data_opt->size() == meta.write_size) {
+                    // Skip meta in full_data to get encrypted.
+                    encrypted_data.assign(full_data_opt->begin() + sizeof(MetaData), full_data_opt->end());
+                    // Decrypt.
+                    AES256Encryption::getInstance().set_key(key);
+                    plain_data = AES256Encryption::getInstance().decrypt(encrypted_data);
+                    std::cout << CLI_GREEN << "Extracted " << plain_data.size() << " bytes from pixels." << CLI_RESET << std::endl;
+                    return plain_data;
+                }
             }
-        } else if (!is_loadable) {
-            meta_from_pixels = false;  // For JPEG: fallback.
         }
 
-        // Step 3: Fallback to DCT for JPEG (if not meta_from_pixels).
-        if (!meta_from_pixels) {
-            dct_fallback_used = true;
-            JpegDecompressRAII decompress;
-            FILE* infile = std::fopen(path.c_str(), "rb");
-            if (!infile) {
-                std::cerr << CLI_RED << "Error: Failed to open for JPEG fallback: " << path << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-            auto close_infile = [](FILE* f) { std::fclose(f); };
-            std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
-
-            jpeg_stdio_src(&decompress.cinfo, infile);
-            if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
-                std::cerr << CLI_RED << "Error: JPEG header suspended in fallback." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-
-            jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
-            if (!coef_arrays) {
-                std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients for fallback." << CLI_RESET << std::endl;
-                return std::nullopt;
-            }
-
-            // Extract meta from DCT (1-bit LSB).
-            auto meta_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, sizeof(MetaData));
-            if (!meta_dct_opt || meta_dct_opt->size() != sizeof(MetaData)) {
-                std::cerr << CLI_RED << "Error: Failed to extract JPEG metadata from DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-            std::memcpy(&this->embed_data->meta, meta_dct_opt->data(), sizeof(MetaData));
-
-            // Validate DCT meta.
-            if (this->embed_data->meta.container != ContainerType::PHOTO ||
-                this->embed_data->meta.ext != Extension::JPEG ||
-                this->embed_data->meta.write_size < sizeof(MetaData)) {
-                std::cerr << CLI_RED << "Error: Invalid JPEG metadata from DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-
-            // Full extraction from DCT.
-            uint64_t full_bytes = this->embed_data->meta.write_size;
-            auto full_dct_opt = this->dct_lsb_extract(coef_arrays, decompress.cinfo, full_bytes);
-            if (!full_dct_opt || full_dct_opt->size() != full_bytes) {
-                std::cerr << CLI_RED << "Error: Incomplete full extraction from JPEG DCT." << CLI_RESET << std::endl;
-                jpeg_finish_decompress(&decompress.cinfo);
-                return std::nullopt;
-            }
-
-            // Encrypt_data (skip meta).
-            uint64_t encrypt_bytes = full_bytes - sizeof(MetaData);
-            std::vector<byte> encrypt_data(full_dct_opt->begin() + sizeof(MetaData), full_dct_opt->end());
-            this->embed_data->encrypt_data = std::move(encrypt_data);
-
-            jpeg_finish_decompress(&decompress.cinfo);
-
-            // Decrypt (key already set).
-            AES256Encryption::getInstance().set_key(this->embed_data->key);
-            this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
-
-            std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from JPEG DCT." << CLI_RESET << std::endl;
-            return this->embed_data->plain_data;
+        // Fallback to DCT for JPEG.
+        if (filetype == "jpg" || filetype == "jpeg") {
+            image_guard.reset();  // Free pixel image as not needed.
+            return jpg_extract(path, key);
         }
 
-        // Step 4: Meta valid from pixels — branch by ext (switch for symmetry).
-        if (dct_fallback_used) {
-            return this->embed_data->plain_data;  // Fallback already processed.
-        }
-        std::optional<std::string> result;
-        switch (this->embed_data->meta.ext) {
-            case Extension::PNG:
-                result = png_out(image, this->embed_data->meta, path);
-                break;
-            case Extension::JPEG:
-                // Rare case: JPEG with valid pixel meta — fallback to DCT.
-                std::cerr << CLI_YELLOW << "Warning: JPEG detected via pixels; using DCT fallback." << CLI_RESET << std::endl;
-                image_guard.reset();
-                result = jpg_out(path);
-                break;
-            default:
-                std::cerr << CLI_YELLOW << "Warning: Unsupported extension in metadata." << CLI_RESET << std::endl;
-                return std::nullopt;
-        }
+        std::cerr << CLI_RED << "Error: No valid data extracted." << CLI_RESET << std::endl;
+        return std::nullopt;
+    }
 
-        if (!result.has_value()) {
+    std::optional<std::vector<byte>> PhotoHnS::jpg_extract(const std::string& path,
+                                                           const std::array<byte, SHA256_DIGEST_LENGTH>& key)
+    {
+        JpegDecompressRAII decompress;
+        FILE* infile = std::fopen(path.c_str(), "rb");
+        if (!infile) {
+            std::cerr << CLI_RED << "Error: Failed to open JPEG: " << path << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
+        auto close_infile = [](FILE* f) { std::fclose(f); };
+        std::unique_ptr<FILE, decltype(close_infile)> infile_guard(infile, close_infile);
+
+        jpeg_stdio_src(&decompress.cinfo, infile);
+        if (jpeg_read_header(&decompress.cinfo, TRUE) == JPEG_SUSPENDED) {
+            std::cerr << CLI_RED << "Error: JPEG header suspended." << CLI_RESET << std::endl;
             return std::nullopt;
         }
 
-        // Step 5: Decrypt (for PNG, key already set).
-        AES256Encryption::getInstance().set_key(this->embed_data->key);
-        this->embed_data->plain_data = AES256Encryption::getInstance().decrypt(this->embed_data->encrypt_data);
+        jvirt_barray_ptr* coef_arrays = jpeg_read_coefficients(&decompress.cinfo);
+        if (!coef_arrays) {
+            std::cerr << CLI_RED << "Error: Failed to read JPEG coefficients." << CLI_RESET << std::endl;
+            return std::nullopt;
+        }
 
-        std::cout << CLI_GREEN << "Extracted " << this->embed_data->plain_data.size() << " bytes from PNG pixels." << CLI_RESET << std::endl;
-        return this->embed_data->plain_data;
+        // Extract meta from DCT (1-bit LSB).
+        auto meta_dct_opt = dct_lsb_extract(coef_arrays, decompress.cinfo, sizeof(MetaData));
+        if (!meta_dct_opt || meta_dct_opt->size() != sizeof(MetaData)) {
+            std::cerr << CLI_RED << "Error: Failed to extract JPEG metadata from DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+        MetaData meta;
+        std::memcpy(&meta, meta_dct_opt->data(), sizeof(MetaData));
+
+        // Validate DCT meta.
+        if (meta.container != ContainerType::PHOTO ||
+            meta.ext != Extension::JPEG ||
+            meta.write_size < sizeof(MetaData) ||
+            meta.meta_size != sizeof(MetaData)) {
+            std::cerr << CLI_RED << "Error: Invalid JPEG metadata from DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+
+        // Full extraction from DCT.
+        auto full_dct_opt = dct_lsb_extract(coef_arrays, decompress.cinfo, meta.write_size);
+        if (!full_dct_opt || full_dct_opt->size() != meta.write_size) {
+            std::cerr << CLI_RED << "Error: Incomplete full extraction from JPEG DCT." << CLI_RESET << std::endl;
+            jpeg_finish_decompress(&decompress.cinfo);
+            return std::nullopt;
+        }
+
+        // Encrypted data (skip meta).
+        std::vector<byte> encrypted_data(full_dct_opt->begin() + sizeof(MetaData), full_dct_opt->end());
+
+        jpeg_finish_decompress(&decompress.cinfo);
+
+        // Decrypt.
+        AES256Encryption::getInstance().set_key(key);
+        std::vector<byte> plain_data = AES256Encryption::getInstance().decrypt(encrypted_data);
+
+        std::cout << CLI_GREEN << "Extracted " << plain_data.size() << " bytes from JPEG DCT." << CLI_RESET << std::endl;
+        return plain_data;
+    }
+
+    std::optional<MetaData> PhotoHnS::extract_meta_from_pixels(const byte* image, uint64_t img_bytes)
+    {
+        // Try 1-bit mode first for meta.
+        auto data_opt = lsb_extract_one_bit(image, sizeof(MetaData), img_bytes);
+        if (data_opt) {
+            MetaData meta;
+            std::memcpy(&meta, data_opt->data(), sizeof(MetaData));
+            if (meta.lsb_mode == LsbMode::OneBit && meta.meta_size == sizeof(MetaData)) {
+                return meta;
+            }
+        }
+
+        // Try 2-bit mode for meta.
+        data_opt = lsb_extract_two_bit(image, sizeof(MetaData), img_bytes);
+        if (data_opt) {
+            MetaData meta;
+            std::memcpy(&meta, data_opt->data(), sizeof(MetaData));
+            if (meta.lsb_mode == LsbMode::TwoBits && meta.meta_size == sizeof(MetaData)) {
+                return meta;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<std::vector<byte>> PhotoHnS::extract_data_from_pixels(const byte* image, uint64_t img_bytes,
+                                                                        uint64_t data_bytes, LsbMode mode)
+    {
+        if (mode == LsbMode::OneBit) {
+            return lsb_extract_one_bit(image, data_bytes, img_bytes);
+        } else if (mode == LsbMode::TwoBits) {
+            return lsb_extract_two_bit(image, data_bytes, img_bytes);
+        }
+        return std::nullopt;
+    }
+
+    void PhotoHnS::lsb_one_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes)
+    {
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data.size() * 8ULL;
+        for (uint64_t i = 0; i < img_bytes && bit_index < data_bits; ++i) {
+            // Clear LSB and set from data bit (MSB-first).
+            byte bit = (data[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+            image[i] = (image[i] & 0xFE) | bit;
+            ++bit_index;
+        }
+    }
+
+    void PhotoHnS::lsb_two_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes)
+    {
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data.size() * 8ULL;
+        for (uint64_t i = 0; i < img_bytes && bit_index < data_bits; ++i) {
+            // Clear 2 LSBs and set from data bits (MSB-first).
+            byte bits = (data[bit_index / 8] >> (6 - (bit_index % 8))) & 3;  // Get 2 bits.
+            image[i] = (image[i] & 0xFC) | bits;
+            bit_index += 2;
+        }
+    }
+
+    std::optional<std::vector<byte>> PhotoHnS::lsb_extract_one_bit(const byte* image, uint64_t data_bytes, uint64_t img_bytes) const
+    {
+        std::vector<byte> data(data_bytes, 0);
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data_bytes * 8ULL;
+        if (data_bits > img_bytes) return std::nullopt;  // Insufficient capacity.
+
+        for (uint64_t i = 0; i < img_bytes && bit_index < data_bits; ++i) {
+            byte bit = image[i] & 1;
+            data[bit_index / 8] |= (bit << (7 - (bit_index % 8)));
+            ++bit_index;
+        }
+        return (bit_index == data_bits) ? std::make_optional(data) : std::nullopt;
+    }
+
+    std::optional<std::vector<byte>> PhotoHnS::lsb_extract_two_bit(const byte* image, uint64_t data_bytes, uint64_t img_bytes) const
+    {
+        std::vector<byte> data(data_bytes, 0);
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data_bytes * 8ULL;
+        if (data_bits > img_bytes * 2ULL) return std::nullopt;  // Insufficient capacity.
+
+        for (uint64_t i = 0; i < img_bytes && bit_index < data_bits; ++i) {
+            byte bits = image[i] & 3;
+            data[bit_index / 8] |= (bits << (6 - (bit_index % 8)));  // Set 2 bits MSB-first.
+            bit_index += 2;
+        }
+        return (bit_index == data_bits) ? std::make_optional(data) : std::nullopt;
+    }
+
+    void PhotoHnS::dct_lsb_embed(jvirt_barray_ptr* coef_arrays, const jpeg_decompress_struct& cinfo,
+                                 const std::vector<byte>& data)
+    {
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data.size() * 8ULL;
+
+        // Iterate over components (Y, Cb, Cr).
+        for (int comp = 0; comp < cinfo.num_components; ++comp) {
+            jpeg_component_info* comp_info = &cinfo.comp_info[comp];
+            uint32_t num_blocks_h = (cinfo.image_width + comp_info->h_samp_factor * DCTSIZE - 1) / (comp_info->h_samp_factor * DCTSIZE);
+            uint32_t num_blocks_v = (cinfo.image_height + comp_info->v_samp_factor * DCTSIZE - 1) / (comp_info->v_samp_factor * DCTSIZE);
+
+            for (uint32_t block_y = 0; block_y < num_blocks_v; ++block_y) {
+                JBLOCKARRAY block_row = (cinfo.mem->access_virt_barray)((j_common_ptr)&cinfo, coef_arrays[comp], block_y, 1, TRUE);
+                for (uint32_t block_x = 0; block_x < num_blocks_h; ++block_x) {
+                    JCOEFPTR coeffs = block_row[block_x][0];
+                    // Skip DC (coeffs[0]), embed in low-freq AC (zigzag order, first few).
+                    for (int k = 1; k < 8 && bit_index < data_bits; ++k) {  // Limit to low-freq for robustness.
+                        if (coeffs[k] != 0) {  // Only non-zero coeffs to avoid creating new runs.
+                            byte bit = (data[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+                            coeffs[k] = (coeffs[k] & ~1) | bit;  // Set LSB.
+                            ++bit_index;
+                        }
+                    }
+                }
+            }
+            if (bit_index >= data_bits) return;
+        }
+    }
+
+    std::optional<std::vector<byte>> PhotoHnS::dct_lsb_extract(jvirt_barray_ptr* coef_arrays,
+                                                               const jpeg_decompress_struct& cinfo,
+                                                               uint64_t data_bytes) const
+    {
+        std::vector<byte> data(data_bytes, 0);
+        uint64_t bit_index = 0;
+        uint64_t data_bits = data_bytes * 8ULL;
+
+        // Iterate over components similarly.
+        for (int comp = 0; comp < cinfo.num_components; ++comp) {
+            jpeg_component_info* comp_info = &cinfo.comp_info[comp];
+            uint32_t num_blocks_h = (cinfo.image_width + comp_info->h_samp_factor * DCTSIZE - 1) / (comp_info->h_samp_factor * DCTSIZE);
+            uint32_t num_blocks_v = (cinfo.image_height + comp_info->v_samp_factor * DCTSIZE - 1) / (comp_info->v_samp_factor * DCTSIZE);
+
+            for (uint32_t block_y = 0; block_y < num_blocks_v; ++block_y) {
+                JBLOCKARRAY block_row = (cinfo.mem->access_virt_barray)((j_common_ptr)&cinfo, coef_arrays[comp], block_y, 1, FALSE);
+                for (uint32_t block_x = 0; block_x < num_blocks_h; ++block_x) {
+                    JCOEFPTR coeffs = block_row[block_x][0];
+                    for (int k = 1; k < 8 && bit_index < data_bits; ++k) {
+                        if (coeffs[k] != 0) {
+                            byte bit = coeffs[k] & 1;
+                            data[bit_index / 8] |= (bit << (7 - (bit_index % 8)));
+                            ++bit_index;
+                        }
+                    }
+                }
+            }
+            if (bit_index >= data_bits) return data;
+        }
+        return (bit_index == data_bits) ? std::make_optional(data) : std::nullopt;
     }
 
 } // Yps

@@ -1,18 +1,19 @@
+// PhotoHnS.hh
 #ifndef YPSHNS_PHOTOHNS_HH
 #define YPSHNS_PHOTOHNS_HH
 
 #include <memory>
 #include <HnS.hh>
-#include <EmbedData.hh>
 #include <Encryption.hh>
+#include <EmbedData.hh>
 #include <jpeglib.h>  // libjpeg-turbo
 #include <array>
-#include <algorithm>  // Для std::clamp
-#include <iomanip>    // Для std::hex в debug
+#include <algorithm>  // For std::clamp
+#include <iomanip>    // For std::hex in debug
 
 namespace Yps
 {
-    // RAII для jpeg_decompress_struct (авто-cleanup).
+    // RAII for jpeg_decompress_struct (auto-cleanup).
     class JpegDecompressRAII {
     public:
         jpeg_decompress_struct cinfo;
@@ -26,7 +27,7 @@ namespace Yps
         JpegDecompressRAII& operator=(const JpegDecompressRAII&) = delete;
     };
 
-    // RAII для jpeg_compress_struct.
+    // RAII for jpeg_compress_struct.
     class JpegCompressRAII {
     public:
         jpeg_compress_struct cinfo;
@@ -44,99 +45,135 @@ namespace Yps
     {
     private:
         /**
-         * Проверка альфа-канала в PNG: Полная непрозрачность (255) для встраивания без артефактов.
-         * @param image Сырые байты изображения.
-         * @param width/height/ channels Размеры.
-         * @return true, если альфа usable (все 255).
+         * Check alpha channel in PNG: Full opacity (255) to embed without artifacts.
+         * @param image Raw image bytes.
+         * @param width/height/channels Dimensions.
+         * @return true if alpha is usable (all 255).
          */
         static bool has_usable_alpha(const byte* image, int32_t width, int32_t height, int32_t channels);
 
         /**
-         * Embed в PNG: LSB в пикселях (1/2 бита на байт).
-         * @param out_path Выходной файл.
-         * @return out_path или nullopt (fail).
+         * Embed into PNG: LSB in pixels (1/2 bits per byte).
+         * @param path Input file.
+         * @param out_path Output file.
+         * @param encrypted_data Encrypted data.
+         * @param meta Metadata (updated with mode).
+         * @return out_path or nullopt on failure.
          */
-        std::optional<std::string> png_in(const std::string& out_path);
+        std::optional<std::string> png_embed(const std::string& path, const std::string& out_path,
+                                             const std::vector<byte>& encrypted_data, MetaData& meta);
 
         /**
-         * Extract из PNG: LSB из пикселей.
-         * @param image Загруженные байты (stb).
-         * @param meta Извлечённые метаданные.
-         * @param path Для логов.
-         * @return path или nullopt.
+         * Embed into JPEG: LSB in AC-DCT coefficients (low-freq, robust to re-compression).
+         * @param path Input file.
+         * @param out_path Output file.
+         * @param encrypted_data Encrypted data.
+         * @param meta Metadata.
+         * @return out_path or nullopt on failure.
          */
-        std::optional<std::string> png_out(byte* image, MetaData& meta, const std::string& path);
+        std::optional<std::string> jpg_embed(const std::string& path, const std::string& out_path,
+                                             const std::vector<byte>& encrypted_data, const MetaData& meta);
 
         /**
-         * Embed в JPEG: LSB в AC-DCT-коэффициентах (low-freq, robust to re-compress).
-         * @param out_path Выходной файл.
-         * @return out_path или nullopt.
+         * Extract from JPEG: LSB from AC-DCT coefficients.
+         * @param path Input file.
+         * @param key Decryption key.
+         * @return Plain data or nullopt on failure.
          */
-        std::optional<std::string> jpg_in(const std::string& out_path);
+        std::optional<std::vector<byte>> jpg_extract(const std::string& path,
+                                                     const std::array<byte, SHA256_DIGEST_LENGTH>& key);
 
         /**
-         * Extract из JPEG: LSB из AC-DCT-коэффициентов.
-         * @param path Входной файл (direct DCT-access).
-         * @return path или nullopt.
+         * Extract metadata from pixels (try 1-bit, then 2-bit mode).
+         * @param image Image bytes.
+         * @param img_bytes Size in bytes.
+         * @return MetaData or nullopt if not found.
          */
-        std::optional<std::string> jpg_out(const std::string& path);
+        std::optional<MetaData> extract_meta_from_pixels(const byte* image, uint64_t img_bytes);
 
         /**
-         * LSB 1-бит на байт изображения (MSB-first, для PNG pixels).
-         * @param image Модифицируется in-place.
-         * @param data Данные для embed (const-ref).
-         * @param img_bytes Общий размер для bounds.
+         * Extract data from pixels based on mode.
+         * @param image Image bytes.
+         * @param img_bytes Size in bytes.
+         * @param data_bytes Expected size.
+         * @param mode LSB mode.
+         * @return Full data or nullopt if incomplete.
+         */
+        std::optional<std::vector<byte>> extract_data_from_pixels(const byte* image, uint64_t img_bytes,
+                                                                  uint64_t data_bytes, LsbMode mode);
+
+        /**
+         * LSB 1-bit per image byte (MSB-first, for PNG pixels).
+         * @param image Modified in-place.
+         * @param data Data to embed (const-ref).
+         * @param img_bytes Bounds for safety.
          */
         void lsb_one_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes);
 
         /**
-         * LSB 2-бита на байт (meta в 1-bit, остальное 2-bit; для PNG ёмкости).
-         * @param image Модифицируется in-place.
-         * @param data Данные.
+         * LSB 2-bits per byte (for PNG capacity; meta in 1-bit if mixed).
+         * @param image Modified in-place.
+         * @param data Data.
          * @param img_bytes Bounds.
          */
         void lsb_two_bit(byte* image, const std::vector<byte>& data, uint64_t img_bytes);
 
         /**
-         * DCT-LSB embed: 1-бит в low-freq AC-коэффициентах (skip DC).
-         * @param coef_arrays DCT-блоки (jvirt_barray_ptr*).
-         * @param cinfo Decompress info (для loops).
-         * @param data Данные (meta + encrypt).
+         * LSB extract 1-bit.
+         * @param image Bytes.
+         * @param data_bytes Expected size.
+         * @param img_bytes Bounds.
+         * @return Data or nullopt if incomplete.
+         */
+        std::optional<std::vector<byte>> lsb_extract_one_bit(const byte* image, uint64_t data_bytes, uint64_t img_bytes) const;
+
+        /**
+         * LSB extract 2-bits.
+         * @param image Bytes.
+         * @param data_bytes Expected size.
+         * @param img_bytes Bounds.
+         * @return Data or nullopt if incomplete.
+         */
+        std::optional<std::vector<byte>> lsb_extract_two_bit(const byte* image, uint64_t data_bytes, uint64_t img_bytes) const;
+
+        /**
+         * DCT-LSB embed: 1-bit in low-freq AC coefficients (skip DC).
+         * @param coef_arrays DCT blocks.
+         * @param cinfo Decompress info for loops.
+         * @param data Data (meta + encrypted).
          */
         void dct_lsb_embed(jvirt_barray_ptr* coef_arrays, const jpeg_decompress_struct& cinfo,
                            const std::vector<byte>& data);
 
         /**
-         * DCT-LSB extract: 1-бит из AC-коэффициентов (MSB-first).
-         * @param coef_arrays DCT-блоки.
+         * DCT-LSB extract: 1-bit from AC coefficients (MSB-first).
+         * @param coef_arrays DCT blocks.
          * @param cinfo Decompress info.
-         * @param data_bytes Ожидаемый размер (meta + encrypt).
-         * @return full_data или nullopt (incomplete).
+         * @param data_bytes Expected size (meta + encrypted).
+         * @return Full data or nullopt if incomplete.
          */
         std::optional<std::vector<byte>> dct_lsb_extract(jvirt_barray_ptr* coef_arrays,
-                                                        const jpeg_decompress_struct& cinfo,
-                                                        uint64_t data_bytes) const;
-
-        std::unique_ptr<EmbedData> embed_data;  // Контекст: plain/encrypt/meta/key.
+                                                         const jpeg_decompress_struct& cinfo,
+                                                         uint64_t data_bytes) const;
 
     public:
         ~PhotoHnS() = default;
         PhotoHnS() = default;
 
         /**
-         * Embed данных в фото (PNG/JPEG auto-detect).
-         * @param data Данные для скрытия.
-         * @param path Входное фото.
-         * @param out_path Выходное (модифицированное).
-         * @return out_path или nullopt (fail: invalid path/capacity).
+         * Embed data into photo (PNG/JPEG auto-detect).
+         * @param data Data to hide.
+         * @param path Input photo.
+         * @param out_path Output (modified).
+         * @return out_path or nullopt on failure (invalid path/capacity).
          */
         std::optional<std::string> embed(const std::vector<byte>& data, const std::string& path,
                                          const std::string& out_path) override;
 
         /**
-         * Extract данных из фото (PNG/JPEG по meta).
-         * @param path Файл с embedded данными.
-         * @return plain_data или nullopt (fail: no meta/invalid).
+         * Extract data from photo (PNG/JPEG based on meta).
+         * @param path File with embedded data.
+         * @return Plain data or nullopt on failure (no meta/invalid).
          */
         std::optional<std::vector<byte>> extract(const std::string& path) override;
     };
